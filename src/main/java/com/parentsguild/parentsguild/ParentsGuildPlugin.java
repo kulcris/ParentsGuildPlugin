@@ -781,11 +781,17 @@ public class ParentsGuildPlugin extends Plugin
 
     private void updateBingoBoardPopup()
     {
-        final ParentsGuildBoardPopup popup = bingoBoardPopup;
-        if (popup != null)
+        if (SwingUtilities.isEventDispatchThread())
         {
-            popup.updateBoardState(bingoBoardState);
+            final ParentsGuildBoardPopup popup = bingoBoardPopup;
+            if (popup != null)
+            {
+                popup.updateBoardState(bingoBoardState);
+            }
+            return;
         }
+
+        SwingUtilities.invokeLater(this::updateBingoBoardPopup);
     }
 
     // Drop detection
