@@ -1,6 +1,6 @@
 # ParentsGuild
 
-RuneLite external plugin for two ParentsGuild workflows:
+RuneLite external plugin for ParentsGuild workflows:
 
 - submit screenshot-backed bingo drop claims to the ParentsGuild website
 - show active Wise Old Man group events with in-plugin leaderboards and end-of-event refresh warnings
@@ -19,7 +19,7 @@ RuneLite external plugin for two ParentsGuild workflows:
 
 ## Plugin Config
 
-- `Website base URL`: example `https://theparentsguild.org`
+- `Website base URL`
 - `Enable bingo drops`
 - `Bingo drop token`: use the per-board token shown on the bingo host controls page
 - `Show bingo overlay`
@@ -28,16 +28,3 @@ RuneLite external plugin for two ParentsGuild workflows:
 - `WOM warning minutes`
 - `Leaderboard rows`
 - `Debug logging`
-
-## Build
-
-This project targets Java 11.
-
-```powershell
-$env:JAVA_HOME='C:\Users\kulcr\.jdks\temurin-11.0.30'
-$env:PATH="$env:JAVA_HOME\bin;$env:PATH"
-.\gradlew.bat test
-.\gradlew.bat shadowJar
-```
-
-The packaged jar is written to `build\libs\`.
