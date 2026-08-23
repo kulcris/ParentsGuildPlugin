@@ -21,8 +21,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -53,8 +51,6 @@ class ParentsGuildPanel extends PluginPanel
         .withZone(LOCAL_ZONE);
     private static final DateTimeFormatter CALENDAR_TIME_FORMAT = DateTimeFormatter.ofPattern("M/d h:mm a")
         .withZone(LOCAL_ZONE);
-    private static final Pattern URL_PATTERN = Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
-
     private final ParentsGuildPlugin plugin;
     private final JButton refreshButton = new JButton("Refresh");
     private final JButton boardButton = new JButton("Open Board");
@@ -246,10 +242,10 @@ class ParentsGuildPanel extends PluginPanel
             card.add(Box.createVerticalStrut(8));
         }
         card.add(boardButton);
-        if (bingo != null && bingo.getBoardUrl() != null && !bingo.getBoardUrl().trim().isEmpty())
+        if (bingo != null && bingo.isActive())
         {
             card.add(Box.createVerticalStrut(6));
-            card.add(linkButton("Open Website Board", bingo.getBoardUrl()));
+            card.add(linkButton("Open Website Board", plugin::openWebsiteBingoBoard));
         }
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, card.getPreferredSize().height));
         return card;
@@ -272,11 +268,6 @@ class ParentsGuildPanel extends PluginPanel
             {
                 card.add(profileLine("Updated", formatDateTime(announcement.getUpdatedAtUtc())));
             }
-            if (announcement.getUrl() != null && !announcement.getUrl().trim().isEmpty())
-            {
-                card.add(Box.createVerticalStrut(6));
-                card.add(linkButton("Open Announcement", announcement.getUrl(), () -> plugin.markAnnouncementSeen(currentAnnouncementMarker)));
-            }
         }
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, card.getPreferredSize().height));
         return card;
@@ -294,12 +285,18 @@ class ParentsGuildPanel extends PluginPanel
             final JPanel grid = new JPanel(new GridLayout(0, 2, 6, 6));
             grid.setOpaque(false);
             grid.setAlignmentX(LEFT_ALIGNMENT);
-            addLinkIfPresent(grid, "Website", links.getWebsite());
-            addLinkIfPresent(grid, "Discord", links.getDiscord());
-            addLinkIfPresent(grid, "WOM Group", links.getWomGroup());
+            addLink(grid, "Website", plugin::openWebsiteHome);
+            if (!ParentsGuildPlugin.discordInviteUrl(links.getDiscordInviteCode()).isEmpty())
+            {
+                addLink(grid, "Discord", () -> plugin.openDiscordInvite(links.getDiscordInviteCode()));
+            }
+            if (links.getWomGroupId() > 0)
+            {
+                addLink(grid, "WOM Group", () -> plugin.openWomGroup(links.getWomGroupId()));
+            }
             if (profile != null && profile.isAvailable())
             {
-                addLinkIfPresent(grid, "My Profile", plugin.websiteProfileUrl(profile));
+                addLink(grid, "My Profile", () -> plugin.openWebsiteProfile(profile));
             }
             if (grid.getComponentCount() == 0)
             {
@@ -429,11 +426,15 @@ class ParentsGuildPanel extends PluginPanel
             card.add(Box.createVerticalStrut(6));
             addCompetitionLeaderboard(card, matchingCompetition);
         }
-        final String eventUrl = matchingCompetition == null ? eventActionUrl(event) : womCompetitionUrl(matchingCompetition);
-        if (eventUrl != null && !eventUrl.trim().isEmpty())
+        if (matchingCompetition != null)
         {
             card.add(Box.createVerticalStrut(6));
-            card.add(linkButton(eventUrl.toLowerCase(Locale.ROOT).contains("wiseoldman.net") ? "Open WOM Event" : "Open Discord Event", eventUrl));
+            card.add(linkButton("Open WOM Event", () -> plugin.openWomCompetition(matchingCompetition.getId())));
+        }
+        else if (event.getWomCompetitionId() > 0)
+        {
+            card.add(Box.createVerticalStrut(6));
+            card.add(linkButton("Open WOM Event", () -> plugin.openWomCompetition(event.getWomCompetitionId())));
         }
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, card.getPreferredSize().height));
         return card;
@@ -534,23 +535,14 @@ class ParentsGuildPanel extends PluginPanel
         return line;
     }
 
-    private JButton linkButton(String label, String url)
-    {
-        return linkButton(label, url, null);
-    }
-
-    private JButton linkButton(String label, String url, Runnable beforeOpen)
+    private JButton linkButton(String label, Runnable action)
     {
         final JButton button = new JButton(label);
         button.setAlignmentX(LEFT_ALIGNMENT);
         button.addActionListener(event -> {
-            if (beforeOpen != null)
+            if (action != null)
             {
-                beforeOpen.run();
-            }
-            if (url != null && !url.trim().isEmpty())
-            {
-                plugin.openExternalUrl(url, label);
+                action.run();
             }
         });
         return button;
@@ -572,13 +564,9 @@ class ParentsGuildPanel extends PluginPanel
         return button;
     }
 
-    private void addLinkIfPresent(JPanel container, String label, String url)
+    private void addLink(JPanel container, String label, Runnable action)
     {
-        if (url == null || url.trim().isEmpty())
-        {
-            return;
-        }
-        final JButton button = linkButton(label, url);
+        final JButton button = linkButton(label, action);
         button.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
         container.add(button);
     }
@@ -614,26 +602,6 @@ class ParentsGuildPanel extends PluginPanel
             .replace('\r', '\n')
             .replaceAll("(?i)\\s+(Type\\s*:)", "\n$1")
             .replaceAll("(?i)\\s+(Wise\\s+Old\\s+Man\\s*:)", "\n$1");
-    }
-
-    private static String firstWiseOldManUrl(String description, String fallbackUrl)
-    {
-        final Matcher matcher = URL_PATTERN.matcher(description == null ? "" : description);
-        while (matcher.find())
-        {
-            final String url = matcher.group().replaceAll("[\\])},.]+$", "");
-            if (url.toLowerCase(Locale.ROOT).contains("wiseoldman.net"))
-            {
-                return url;
-            }
-        }
-        return fallbackUrl == null ? "" : fallbackUrl;
-    }
-
-    private static String eventActionUrl(ParentsGuildPlugin.UpcomingEventState event)
-    {
-        final String womUrl = firstWiseOldManUrl(event.getDescription(), "");
-        return womUrl.isEmpty() ? event.getUrl() : womUrl;
     }
 
     private JPanel buildEmptyState()
@@ -747,7 +715,7 @@ class ParentsGuildPanel extends PluginPanel
             card.add(profileLine("Gap to next", ParentsGuildPlugin.formatMetricValue(competition.getGapToNext())));
         }
         card.add(Box.createVerticalStrut(6));
-        card.add(linkButton("Open WOM Event", womCompetitionUrl(competition)));
+        card.add(linkButton("Open WOM Event", () -> plugin.openWomCompetition(competition.getId())));
 
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, card.getPreferredSize().height));
         return card;
@@ -891,11 +859,6 @@ class ParentsGuildPanel extends PluginPanel
         return (value == null ? "" : value)
             .toLowerCase(Locale.ROOT)
             .replaceAll("[^a-z0-9]+", "");
-    }
-
-    private static String womCompetitionUrl(ParentsGuildPlugin.CompetitionView competition)
-    {
-        return "https://wiseoldman.net/competitions/" + competition.getId();
     }
 
     private static String announcementMarker(ParentsGuildPlugin.AnnouncementState announcement)

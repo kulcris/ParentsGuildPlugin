@@ -665,25 +665,62 @@ public class ParentsGuildPlugin extends Plugin
 
     void openWebsiteBingoBoard()
     {
-        final String base = resolveEndpointBase(config.websiteBaseUrl());
-        if (base.isEmpty())
-        {
-            notifier.notify("ParentsGuild: set the website base URL before opening the website board.");
-            return;
-        }
+        openConfiguredWebsitePath("/bingo.php", "website bingo board");
+    }
 
-        try
+    void openWebsiteHome()
+    {
+        openConfiguredWebsitePath("/", "website");
+    }
+
+    void openWebsiteProfile(ClanProfileState profile)
+    {
+        openConfiguredWebsitePath(websiteProfilePath(profile), "website profile");
+    }
+
+    void openDiscordInvite(String inviteCode)
+    {
+        openFixedUrl(discordInviteUrl(inviteCode), "Discord invite");
+    }
+
+    void openWomGroup(int groupId)
+    {
+        openFixedUrl(womGroupUrl(groupId), "WOM group");
+    }
+
+    void openWomCompetition(int competitionId)
+    {
+        openFixedUrl(womCompetitionUrl(competitionId), "WOM event");
+    }
+
+    String lastSeenAnnouncementMarker()
+    {
+        final String value = configManager.getConfiguration("parentsguild", "lastSeenAnnouncementMarker");
+        return value == null ? "" : value.trim();
+    }
+
+    void markAnnouncementSeen(String marker)
+    {
+        final String cleaned = cleanText(marker);
+        if (!cleaned.isEmpty())
         {
-            LinkBrowser.browse(base + "/bingo.php");
-        }
-        catch (IllegalArgumentException ex)
-        {
-            log.warn("Failed to open ParentsGuild bingo board", ex);
-            notifier.notify("ParentsGuild: failed to open the website bingo board.");
+            configManager.setConfiguration("parentsguild", "lastSeenAnnouncementMarker", cleaned);
         }
     }
 
-    void openExternalUrl(String url, String label)
+    private void openConfiguredWebsitePath(String path, String label)
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        final String cleanedPath = cleanWebsitePath(path);
+        if (base.isEmpty() || cleanedPath.isEmpty())
+        {
+            notifier.notify("ParentsGuild: set the website base URL before opening " + cleanText(label) + ".");
+            return;
+        }
+        openFixedUrl(base + cleanedPath, label);
+    }
+
+    private void openFixedUrl(String url, String label)
     {
         final String cleanedUrl = cleanText(url);
         if (cleanedUrl.isEmpty())
@@ -703,33 +740,35 @@ public class ParentsGuildPlugin extends Plugin
         }
     }
 
-    String lastSeenAnnouncementMarker()
-    {
-        final String value = configManager.getConfiguration("parentsguild", "lastSeenAnnouncementMarker");
-        return value == null ? "" : value.trim();
-    }
-
-    void markAnnouncementSeen(String marker)
-    {
-        final String cleaned = cleanText(marker);
-        if (!cleaned.isEmpty())
-        {
-            configManager.setConfiguration("parentsguild", "lastSeenAnnouncementMarker", cleaned);
-        }
-    }
-
-    String websiteProfileUrl(ClanProfileState profile)
+    private static String websiteProfilePath(ClanProfileState profile)
     {
         if (profile == null || !profile.isAvailable() || profile.getMemberId() == null || profile.getMemberId().trim().isEmpty())
         {
             return "";
         }
-        final String base = resolveEndpointBase(config.websiteBaseUrl());
-        if (base.isEmpty())
-        {
-            return "";
-        }
-        return base + "/member-profile.php?id=" + urlEncode(profile.getMemberId().trim());
+        return "/member-profile.php?id=" + urlEncode(profile.getMemberId().trim());
+    }
+
+    private static String cleanWebsitePath(String path)
+    {
+        final String cleaned = cleanText(path);
+        return cleaned.startsWith("/") && !cleaned.startsWith("//") ? cleaned : "";
+    }
+
+    static String discordInviteUrl(String inviteCode)
+    {
+        final String cleaned = cleanText(inviteCode);
+        return cleaned.matches("[A-Za-z0-9-]{2,64}") ? "https://discord.gg/" + cleaned : "";
+    }
+
+    static String womGroupUrl(int groupId)
+    {
+        return groupId > 0 ? "https://wiseoldman.net/groups/" + groupId : "";
+    }
+
+    static String womCompetitionUrl(int competitionId)
+    {
+        return competitionId > 0 ? "https://wiseoldman.net/competitions/" + competitionId : "";
     }
 
     // Bingo board data
@@ -1620,7 +1659,6 @@ public class ParentsGuildPlugin extends Plugin
             Math.max(0D, jsonDouble(profile, "overallXp")),
             jsonString(profile, "joinDate"),
             Math.max(0, jsonInt(profile, "seniorityPoints")),
-            jsonString(profile, "womProfileUrl"),
             Math.max(0, jsonInt(profile, "botwWins")),
             Math.max(0, jsonInt(profile, "sotwWins"))
         );
@@ -1662,8 +1700,7 @@ public class ParentsGuildPlugin extends Plugin
             Math.max(0, jsonInt(bingo, "completedTiles")),
             Math.max(0, jsonInt(bingo, "pendingTiles")),
             Math.max(0, jsonInt(bingo, "remainingTiles")),
-            activity,
-            jsonString(bingo, "boardUrl")
+            activity
         );
     }
 
@@ -1765,7 +1802,6 @@ public class ParentsGuildPlugin extends Plugin
     {
         return new AnnouncementState(
             jsonString(announcement, "message"),
-            jsonString(announcement, "url"),
             jsonString(announcement, "updatedAtUtc")
         );
     }
@@ -1773,10 +1809,8 @@ public class ParentsGuildPlugin extends Plugin
     private QuickLinksState parseQuickLinksState(JsonObject links)
     {
         return new QuickLinksState(
-            jsonString(links, "website"),
-            jsonString(links, "discord"),
-            jsonString(links, "womGroup"),
-            jsonString(links, "bingoBoard")
+            jsonString(links, "discordInviteCode"),
+            Math.max(0, jsonInt(links, "womGroupId"))
         );
     }
 
@@ -1802,7 +1836,7 @@ public class ParentsGuildPlugin extends Plugin
                 jsonString(object, "endsAtUtc"),
                 jsonString(object, "eventDate"),
                 jsonString(object, "source"),
-                jsonString(object, "url"),
+                Math.max(0, jsonInt(object, "womCompetitionId")),
                 jsonString(object, "description"),
                 jsonString(object, "location"),
                 jsonString(object, "status"),
@@ -2123,24 +2157,16 @@ public class ParentsGuildPlugin extends Plugin
         return "";
     }
 
-    private String resolveBoardTileImageUrl(String endpoint, JsonObject tile)
+    private String configuredWebsiteApiUrl(String endpoint, String apiPath)
     {
-        final String imageUrl = firstNonBlank(
-            jsonString(tile, "backgroundImageUrl"),
-            jsonString(tile, "tileIconUrl")
-        );
-        if (imageUrl.isEmpty())
+        if (!apiPath.startsWith("/api/"))
         {
             return "";
-        }
-        if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://"))
-        {
-            return imageUrl;
         }
 
         try
         {
-            return URI.create(endpoint).resolve(imageUrl).toString();
+            return URI.create(endpoint).resolve(apiPath).toString();
         }
         catch (IllegalArgumentException ex)
         {
@@ -2163,10 +2189,24 @@ public class ParentsGuildPlugin extends Plugin
             }
             catch (RuntimeException ex)
             {
-                debugLog("Falling back to website tile image for item {} because RuneLite item image failed: {}", itemId, ex.getMessage());
+                debugLog("RuneLite item image failed for item {}: {}", itemId, ex.getMessage());
             }
+            return null;
         }
-        return loadRemoteImage(resolveBoardTileImageUrl(endpoint, tile));
+
+        final String tileId = cleanText(jsonString(tile, "id"));
+        if (!tileId.isEmpty() && !cleanText(jsonString(tile, "backgroundImageStorageName")).isEmpty())
+        {
+            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId)));
+        }
+
+        final String metricKey = cleanText(jsonString(tile, "metricKey"));
+        if ("metric".equals(normalizeName(jsonString(tile, "tileType"))) && metricKey.startsWith("boss:"))
+        {
+            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-icon.php?metricKey=" + urlEncode(metricKey)));
+        }
+
+        return null;
     }
 
     // Image loading
@@ -2671,13 +2711,12 @@ public class ParentsGuildPlugin extends Plugin
         double overallXp;
         String joinDate;
         int seniorityPoints;
-        String womProfileUrl;
         int botwWins;
         int sotwWins;
 
         static ClanProfileState unavailable(String message)
         {
-            return new ClanProfileState(false, message, "", "", "", "", "", 0, 0, "", 0, 0, 0D, "", 0, "", 0, 0);
+            return new ClanProfileState(false, message, "", "", "", "", "", 0, 0, "", 0, 0, 0D, "", 0, 0, 0);
         }
     }
 
@@ -2701,11 +2740,10 @@ public class ParentsGuildPlugin extends Plugin
         int pendingTiles;
         int remainingTiles;
         List<BingoActivityState> recentActivity;
-        String boardUrl;
 
         static BingoPanelState empty()
         {
-            return new BingoPanelState(false, false, "", "", new ArrayList<>(), 0, 0, 0, new ArrayList<>(), "");
+            return new BingoPanelState(false, false, "", "", new ArrayList<>(), 0, 0, 0, new ArrayList<>());
         }
     }
 
@@ -2713,26 +2751,23 @@ public class ParentsGuildPlugin extends Plugin
     static class AnnouncementState
     {
         String message;
-        String url;
         String updatedAtUtc;
 
         static AnnouncementState empty()
         {
-            return new AnnouncementState("", "", "");
+            return new AnnouncementState("", "");
         }
     }
 
     @Value
     static class QuickLinksState
     {
-        String website;
-        String discord;
-        String womGroup;
-        String bingoBoard;
+        String discordInviteCode;
+        int womGroupId;
 
         static QuickLinksState empty()
         {
-            return new QuickLinksState("", "", "", "");
+            return new QuickLinksState("", 0);
         }
     }
 
@@ -2745,7 +2780,7 @@ public class ParentsGuildPlugin extends Plugin
         String endsAtUtc;
         String eventDate;
         String source;
-        String url;
+        int womCompetitionId;
         String description;
         String location;
         String status;
