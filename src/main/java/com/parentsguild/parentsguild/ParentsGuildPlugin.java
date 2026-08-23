@@ -1085,7 +1085,8 @@ public class ParentsGuildPlugin extends Plugin
                     }
 
                     final JsonObject tile = tileElement.getAsJsonObject();
-                    if (!"drop".equals(normalizeName(jsonString(tile, "tileType"))) || bingoDropTileIsComplete(tile))
+                    final String tileType = normalizeName(jsonString(tile, "tileType"));
+                    if (!("drop".equals(tileType) || "multi_item".equals(tileType)) || bingoDropTileIsComplete(tile))
                     {
                         continue;
                     }
@@ -1094,6 +1095,10 @@ public class ParentsGuildPlugin extends Plugin
                     if (dropItemId > 0)
                     {
                         itemIds.add(dropItemId);
+                    }
+                    if ("multi_item".equals(tileType))
+                    {
+                        itemIds.addAll(multiItemTileItemIds(tile));
                     }
                 }
             }
@@ -1110,6 +1115,75 @@ public class ParentsGuildPlugin extends Plugin
 
         final int requiredCompletions = Math.max(1, jsonInt(tile, "requiredCompletions"));
         return jsonInt(tile, "approvedCompletions") >= requiredCompletions;
+    }
+
+    private static Set<Integer> multiItemTileItemIds(JsonObject tile)
+    {
+        final Set<Integer> itemIds = new HashSet<>();
+        for (JsonElement itemElement : jsonArray(tile, "multiItems"))
+        {
+            if (!itemElement.isJsonObject())
+            {
+                continue;
+            }
+
+            final int itemId = jsonInt(itemElement.getAsJsonObject(), "itemId");
+            if (itemId > 0)
+            {
+                itemIds.add(itemId);
+            }
+        }
+        return itemIds;
+    }
+
+    private static int firstMultiItemTileItemId(JsonObject tile)
+    {
+        for (JsonElement itemElement : jsonArray(tile, "multiItems"))
+        {
+            if (!itemElement.isJsonObject())
+            {
+                continue;
+            }
+
+            final int itemId = jsonInt(itemElement.getAsJsonObject(), "itemId");
+            if (itemId > 0)
+            {
+                return itemId;
+            }
+        }
+        return 0;
+    }
+
+    private static String multiItemTileLabel(JsonObject tile)
+    {
+        final List<String> labels = new ArrayList<>();
+        for (JsonElement itemElement : jsonArray(tile, "multiItems"))
+        {
+            if (!itemElement.isJsonObject())
+            {
+                continue;
+            }
+
+            final JsonObject item = itemElement.getAsJsonObject();
+            final String label = firstNonBlank(
+                jsonString(item, "itemName"),
+                jsonString(item, "label"),
+                jsonString(item, "pageTitle")
+            );
+            if (!label.isEmpty())
+            {
+                labels.add(label);
+            }
+        }
+        if (labels.isEmpty())
+        {
+            return "";
+        }
+        if (labels.size() == 1)
+        {
+            return labels.get(0);
+        }
+        return labels.get(0) + " / " + labels.get(1) + (labels.size() > 2 ? " +" + (labels.size() - 2) : "");
     }
 
     private void rememberCompletedDropItem(int itemId)
@@ -1969,6 +2043,7 @@ public class ParentsGuildPlugin extends Plugin
                     final String label = firstNonBlank(
                         jsonString(tile, "label"),
                         jsonString(tile, "dropItemName"),
+                        multiItemTileLabel(tile),
                         jsonString(tile, "metricLabel"),
                         normalizeTileTypeLabel(jsonString(tile, "tileType"))
                     );
@@ -2027,7 +2102,7 @@ public class ParentsGuildPlugin extends Plugin
         final int pendingCompletions = Math.max(0, jsonInt(tile, "pendingCompletions"));
         final int requiredCompletions = Math.max(1, jsonInt(tile, "requiredCompletions"));
         final String tileType = normalizeName(jsonString(tile, "tileType"));
-        if (requiredCompletions > 1 && ("manual".equals(tileType) || "drop".equals(tileType)))
+        if (requiredCompletions > 1 && ("manual".equals(tileType) || "drop".equals(tileType) || "multi_item".equals(tileType)))
         {
             return Math.min(approvedCompletions, requiredCompletions) + "(+" + pendingCompletions + ")/" + requiredCompletions;
         }
@@ -2075,7 +2150,11 @@ public class ParentsGuildPlugin extends Plugin
 
     private BufferedImage boardTileImage(String endpoint, JsonObject tile)
     {
-        final int itemId = jsonInt(tile, "dropItemId");
+        int itemId = jsonInt(tile, "dropItemId");
+        if (itemId <= 0 && "multi_item".equals(normalizeName(jsonString(tile, "tileType"))))
+        {
+            itemId = firstMultiItemTileItemId(tile);
+        }
         if (itemId > 0)
         {
             try
@@ -2250,6 +2329,8 @@ public class ParentsGuildPlugin extends Plugin
                 return "Metric";
             case "drop":
                 return "Drop";
+            case "multi_item":
+                return "Multi item";
             default:
                 return normalized.isEmpty() ? "" : Character.toUpperCase(normalized.charAt(0)) + normalized.substring(1);
         }
