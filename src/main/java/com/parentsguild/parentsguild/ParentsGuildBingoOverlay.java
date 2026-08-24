@@ -7,8 +7,10 @@ import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.time.Instant;
-import java.time.ZoneOffset;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.time.format.FormatStyle;
+import java.util.Locale;
 import javax.inject.Inject;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
@@ -20,8 +22,9 @@ class ParentsGuildBingoOverlay extends Overlay
     private static final Color TEAM_NAME_COLOR = new Color(232, 74, 74);
     private static final Color DETAILS_COLOR = Color.WHITE;
     private static final Color SHADOW_COLOR = new Color(0, 0, 0, 180);
-    private static final DateTimeFormatter OVERLAY_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss 'UTC'")
-        .withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter OVERLAY_TIME_FORMAT = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
+        .withLocale(Locale.getDefault())
+        .withZone(ZoneId.systemDefault());
 
     private final ParentsGuildPlugin plugin;
 

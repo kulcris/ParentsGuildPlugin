@@ -16,6 +16,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.FormatStyle;
 import java.time.temporal.ChronoUnit;
 import java.util.HashSet;
 import java.util.List;
@@ -45,11 +46,14 @@ class ParentsGuildPanel extends PluginPanel
     private static final Color MUTED = new Color(178, 173, 157);
     private static final Color GREEN_GLOW = new Color(72, 204, 94);
     private static final ZoneId LOCAL_ZONE = ZoneId.systemDefault();
-    private static final DateTimeFormatter LOCAL_TIME_FORMAT = DateTimeFormatter.ofPattern("M/d/yy h:mm a")
+    private static final Locale LOCAL_LOCALE = Locale.getDefault();
+    private static final DateTimeFormatter LOCAL_TIME_FORMAT = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
+        .withLocale(LOCAL_LOCALE)
         .withZone(LOCAL_ZONE);
-    private static final DateTimeFormatter CALENDAR_DAY_FORMAT = DateTimeFormatter.ofPattern("M/d")
+    private static final DateTimeFormatter CALENDAR_DAY_FORMAT = localizedMonthDayFormatter()
         .withZone(LOCAL_ZONE);
-    private static final DateTimeFormatter CALENDAR_TIME_FORMAT = DateTimeFormatter.ofPattern("M/d h:mm a")
+    private static final DateTimeFormatter CALENDAR_TIME_FORMAT = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
+        .withLocale(LOCAL_LOCALE)
         .withZone(LOCAL_ZONE);
     private final ParentsGuildPlugin plugin;
     private final JButton refreshButton = new JButton("Refresh");
@@ -98,6 +102,17 @@ class ParentsGuildPanel extends PluginPanel
 
         add(header, BorderLayout.NORTH);
         add(tabs, BorderLayout.CENTER);
+    }
+
+    private static DateTimeFormatter localizedMonthDayFormatter()
+    {
+        final String sample = DateTimeFormatter.ofLocalizedDate(FormatStyle.SHORT)
+            .withLocale(LOCAL_LOCALE)
+            .format(LocalDate.of(2026, 11, 22));
+        final int monthIndex = sample.indexOf("11");
+        final int dayIndex = sample.indexOf("22");
+        final String pattern = dayIndex >= 0 && monthIndex >= 0 && dayIndex < monthIndex ? "d/M" : "M/d";
+        return DateTimeFormatter.ofPattern(pattern).withLocale(LOCAL_LOCALE);
     }
 
     // Panel refresh
