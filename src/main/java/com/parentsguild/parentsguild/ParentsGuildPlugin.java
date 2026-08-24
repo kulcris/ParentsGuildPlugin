@@ -505,9 +505,8 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String endpoint = resolveBingoStatusEndpoint();
-        final String token = config.bingoDropToken().trim();
         final String playerRsn = currentLocalPlayerName();
-        if (endpoint.isEmpty() || token.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
+        if (endpoint.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
         {
             bingoOverlayState = BingoOverlayState.hidden();
             return;
@@ -518,7 +517,7 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        womExecutor.execute(() -> refreshBingoStatusState(endpoint, token, playerRsn, manual));
+        womExecutor.execute(() -> refreshBingoStatusState(endpoint, playerRsn, manual));
     }
 
     private void rescheduleBingoStatusRefresh()
@@ -542,11 +541,11 @@ public class ParentsGuildPlugin extends Plugin
         );
     }
 
-    private void refreshBingoStatusState(String endpoint, String token, String playerRsn, boolean manual)
+    private void refreshBingoStatusState(String endpoint, String playerRsn, boolean manual)
     {
         try
         {
-            final BingoOverlayState nextState = fetchBingoOverlayState(endpoint, token, playerRsn);
+            final BingoOverlayState nextState = fetchBingoOverlayState(endpoint, playerRsn);
             bingoOverlayState = nextState;
         }
         catch (Exception ex)
@@ -644,9 +643,8 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String endpoint = resolveBingoBoardEndpoint();
-        final String token = config.bingoDropToken().trim();
         final String playerRsn = currentLocalPlayerName();
-        if (endpoint.isEmpty() || token.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
+        if (endpoint.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
         {
             bingoBoardState = BingoBoardState.hidden();
             updateBingoBoardPopup();
@@ -658,7 +656,7 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        womExecutor.execute(() -> refreshBingoBoardState(endpoint, token, playerRsn, manual));
+        womExecutor.execute(() -> refreshBingoBoardState(endpoint, playerRsn, manual));
     }
 
     // Side-panel actions
@@ -794,11 +792,11 @@ public class ParentsGuildPlugin extends Plugin
         );
     }
 
-    private void refreshBingoBoardState(String endpoint, String token, String playerRsn, boolean manual)
+    private void refreshBingoBoardState(String endpoint, String playerRsn, boolean manual)
     {
         try
         {
-            bingoBoardState = fetchBingoBoardState(endpoint, token, playerRsn);
+            bingoBoardState = fetchBingoBoardState(endpoint, playerRsn);
             updateBingoBoardPopup();
             pushPanelState();
         }
@@ -916,16 +914,15 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String endpoint = resolveBingoDropEndpoint();
-        final String token = config.bingoDropToken().trim();
         final Player localPlayer = client.getLocalPlayer();
         if (localPlayer == null || items == null || items.isEmpty())
         {
             debugLog("Skipping loot submission because player/items were incomplete.");
             return;
         }
-        if (!isConfiguredForSubmission(endpoint, token))
+        if (!isConfiguredForSubmission(endpoint))
         {
-            warnConfigIncomplete("ParentsGuild: set the website URL and bingo drop token in plugin config.");
+            warnConfigIncomplete("ParentsGuild: set the website URL in plugin config.");
             return;
         }
 
@@ -982,12 +979,12 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        womExecutor.execute(() -> submitEligibleDropScreenshots(endpoint, token, playerRsn, cleanedSourceName, drops));
+        womExecutor.execute(() -> submitEligibleDropScreenshots(endpoint, playerRsn, cleanedSourceName, drops));
     }
 
-    private void submitEligibleDropScreenshots(String dropEndpoint, String token, String playerRsn, String sourceName, List<PendingDrop> drops)
+    private void submitEligibleDropScreenshots(String dropEndpoint, String playerRsn, String sourceName, List<PendingDrop> drops)
     {
-        final List<PendingDrop> eligibleDrops = filterDropsForIncompleteBingoTiles(token, playerRsn, drops);
+        final List<PendingDrop> eligibleDrops = filterDropsForIncompleteBingoTiles(playerRsn, drops);
         if (eligibleDrops.isEmpty())
         {
             debugLog("Skipping bingo drop screenshot because no dropped items matched incomplete drop tiles.");
@@ -1006,7 +1003,7 @@ public class ParentsGuildPlugin extends Plugin
                 final byte[] screenshotBytes = toPngBytes(image);
                 for (PendingDrop drop : eligibleDrops)
                 {
-                    submitDrop(dropEndpoint, token, playerRsn, sourceName, drop, screenshotBytes);
+                    submitDrop(dropEndpoint, playerRsn, sourceName, drop, screenshotBytes);
                 }
             }
             catch (IOException ex)
@@ -1016,7 +1013,7 @@ public class ParentsGuildPlugin extends Plugin
         });
     }
 
-    private List<PendingDrop> filterDropsForIncompleteBingoTiles(String token, String playerRsn, List<PendingDrop> drops)
+    private List<PendingDrop> filterDropsForIncompleteBingoTiles(String playerRsn, List<PendingDrop> drops)
     {
         if (drops.isEmpty())
         {
@@ -1047,7 +1044,7 @@ public class ParentsGuildPlugin extends Plugin
 
         try
         {
-            final Set<Integer> eligibleItemIds = incompleteDropTileItemIds(boardEndpoint, token, playerRsn);
+            final Set<Integer> eligibleItemIds = incompleteDropTileItemIds(boardEndpoint, playerRsn);
             final List<PendingDrop> eligibleDrops = new ArrayList<>();
             for (PendingDrop drop : notKnownCompletedDrops)
             {
@@ -1069,7 +1066,7 @@ public class ParentsGuildPlugin extends Plugin
         }
     }
 
-    private Set<Integer> incompleteDropTileItemIds(String boardEndpoint, String token, String playerRsn) throws IOException
+    private Set<Integer> incompleteDropTileItemIds(String boardEndpoint, String playerRsn) throws IOException
     {
         final long now = System.currentTimeMillis();
         final Set<Integer> cachedItemIds = dropTileEligibilityCache;
@@ -1078,19 +1075,18 @@ public class ParentsGuildPlugin extends Plugin
             return cachedItemIds;
         }
 
-        final Set<Integer> itemIds = fetchIncompleteDropTileItemIds(boardEndpoint, token, playerRsn);
+        final Set<Integer> itemIds = fetchIncompleteDropTileItemIds(boardEndpoint, playerRsn);
         dropTileEligibilityCache = itemIds;
         dropTileEligibilityCacheAtMillis = now;
         return itemIds;
     }
 
-    private Set<Integer> fetchIncompleteDropTileItemIds(String endpoint, String token, String playerRsn) throws IOException
+    private Set<Integer> fetchIncompleteDropTileItemIds(String endpoint, String playerRsn) throws IOException
     {
         final String url = endpoint + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
         final Request request = new Request.Builder()
             .url(url)
             .header("Accept", "application/json")
-            .header("X-BINGO-DROP-TOKEN", token)
             .build();
 
         try (Response response = okHttpClient.newCall(request).execute())
@@ -1240,7 +1236,7 @@ public class ParentsGuildPlugin extends Plugin
         completedDropItemDenyCache.entrySet().removeIf((entry) -> entry.getValue() < cutoff);
     }
 
-    private void submitDrop(String endpoint, String token, String playerRsn, String sourceName, PendingDrop drop, byte[] screenshotBytes)
+    private void submitDrop(String endpoint, String playerRsn, String sourceName, PendingDrop drop, byte[] screenshotBytes)
     {
         final MultipartBody body = new MultipartBody.Builder()
             .setType(MultipartBody.FORM)
@@ -1257,7 +1253,6 @@ public class ParentsGuildPlugin extends Plugin
 
         final Request request = new Request.Builder()
             .url(endpoint)
-            .header("X-BINGO-DROP-TOKEN", token)
             .header("Accept", "application/json")
             .post(body)
             .build();
@@ -1331,10 +1326,9 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String endpoint = resolveBingoProofEndpoint();
-        final String token = config.bingoDropToken().trim();
-        if (!isConfiguredForSubmission(endpoint, token))
+        if (!isConfiguredForSubmission(endpoint))
         {
-            warnConfigIncomplete("ParentsGuild: set the website URL and bingo drop token in plugin config.");
+            warnConfigIncomplete("ParentsGuild: set the website URL in plugin config.");
             return;
         }
 
@@ -1359,7 +1353,7 @@ public class ParentsGuildPlugin extends Plugin
                 }
 
                 final byte[] screenshotBytes = toPngBytes(image);
-                submitTileProof(endpoint, token, playerRsn, cell, eventId, capturedAtUtc, screenshotBytes);
+                submitTileProof(endpoint, playerRsn, cell, eventId, capturedAtUtc, screenshotBytes);
             }
             catch (IOException ex)
             {
@@ -1368,7 +1362,7 @@ public class ParentsGuildPlugin extends Plugin
         });
     }
 
-    private void submitTileProof(String endpoint, String token, String playerRsn, BingoBoardCell cell, String eventId, String capturedAtUtc, byte[] screenshotBytes)
+    private void submitTileProof(String endpoint, String playerRsn, BingoBoardCell cell, String eventId, String capturedAtUtc, byte[] screenshotBytes)
     {
         final MultipartBody body = new MultipartBody.Builder()
             .setType(MultipartBody.FORM)
@@ -1382,7 +1376,6 @@ public class ParentsGuildPlugin extends Plugin
 
         final Request request = new Request.Builder()
             .url(endpoint)
-            .header("X-BINGO-DROP-TOKEN", token)
             .header("Accept", "application/json")
             .post(body)
             .build();
@@ -1523,9 +1516,9 @@ public class ParentsGuildPlugin extends Plugin
         }
     }
 
-    private static boolean isConfiguredForSubmission(String endpoint, String token)
+    private static boolean isConfiguredForSubmission(String endpoint)
     {
-        return !endpoint.isEmpty() && !token.isEmpty();
+        return !endpoint.isEmpty();
     }
 
     private void warnConfigIncomplete(String message)
@@ -1907,13 +1900,12 @@ public class ParentsGuildPlugin extends Plugin
 
     // Bingo payload parsing
 
-    private BingoOverlayState fetchBingoOverlayState(String endpoint, String token, String playerRsn) throws IOException
+    private BingoOverlayState fetchBingoOverlayState(String endpoint, String playerRsn) throws IOException
     {
         final String url = endpoint + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
         final Request request = new Request.Builder()
             .url(url)
             .header("Accept", "application/json")
-            .header("X-BINGO-DROP-TOKEN", token)
             .build();
 
         try (Response response = okHttpClient.newCall(request).execute())
@@ -2027,13 +2019,12 @@ public class ParentsGuildPlugin extends Plugin
         }
     }
 
-    private BingoBoardState fetchBingoBoardState(String endpoint, String token, String playerRsn) throws IOException
+    private BingoBoardState fetchBingoBoardState(String endpoint, String playerRsn) throws IOException
     {
         final String url = endpoint + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
         final Request request = new Request.Builder()
             .url(url)
             .header("Accept", "application/json")
-            .header("X-BINGO-DROP-TOKEN", token)
             .build();
 
         try (Response response = okHttpClient.newCall(request).execute())

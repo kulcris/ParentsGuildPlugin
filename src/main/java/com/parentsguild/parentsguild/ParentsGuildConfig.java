@@ -49,24 +49,12 @@ public interface ParentsGuildConfig extends Config
     }
 
     @ConfigItem(
-        keyName = "bingoDropToken",
-        name = "Bingo drop token",
-        description = "The per-board token shown on the ParentsGuild bingo host controls page.",
-        section = bingoSection,
-        position = 1
-    )
-    default String bingoDropToken()
-    {
-        return "";
-    }
-
-    @ConfigItem(
         keyName = "showBingoOverlay",
         name = "Show bingo overlay",
         description = "Display the active bingo name, team name, and event time in a RuneLite overlay when this account is on the active board.",
         warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
         section = bingoSection,
-        position = 2
+        position = 1
     )
     default boolean showBingoOverlay()
     {
@@ -78,7 +66,7 @@ public interface ParentsGuildConfig extends Config
         name = "Hide chat in proof screenshots",
         description = "Black out the chatbox area before bingo drop proof screenshots are uploaded.",
         section = bingoSection,
-        position = 3
+        position = 2
     )
     default boolean redactChatboxProofScreenshots()
     {
