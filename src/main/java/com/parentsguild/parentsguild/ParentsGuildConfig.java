@@ -62,11 +62,24 @@ public interface ParentsGuildConfig extends Config
     }
 
     @ConfigItem(
+        keyName = "enableBingoMetricTracking",
+        name = "Enable bingo metric tracking",
+        description = "Track local XP, kill count, and clue metric progress for active bingo metric tiles.",
+        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
+        section = bingoSection,
+        position = 2
+    )
+    default boolean enableBingoMetricTracking()
+    {
+        return false;
+    }
+
+    @ConfigItem(
         keyName = "redactChatboxProofScreenshots",
         name = "Hide chat in proof screenshots",
         description = "Black out the chatbox area before bingo drop proof screenshots are uploaded.",
         section = bingoSection,
-        position = 2
+        position = 3
     )
     default boolean redactChatboxProofScreenshots()
     {
@@ -86,13 +99,26 @@ public interface ParentsGuildConfig extends Config
         return false;
     }
 
+    @ConfigItem(
+        keyName = "submitWomRefreshOnLogout",
+        name = "Submit WOM refresh on logout",
+        description = "Automatically request a WOM player update when you log out or hop worlds.",
+        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
+        section = womSection,
+        position = 1
+    )
+    default boolean submitWomRefreshOnLogout()
+    {
+        return false;
+    }
+
     @Range(min = 30, max = 3600)
     @ConfigItem(
         keyName = "womRefreshSeconds",
         name = "WOM refresh interval",
         description = "How often to refresh active WOM competitions, in seconds.",
         section = womSection,
-        position = 1
+        position = 2
     )
     default int womRefreshSeconds()
     {
@@ -105,7 +131,7 @@ public interface ParentsGuildConfig extends Config
         name = "WOM warning minutes",
         description = "Warn to refresh WOM hiscores when an active event is near its end.",
         section = womSection,
-        position = 2
+        position = 3
     )
     default int womWarningMinutesBeforeEnd()
     {
@@ -118,7 +144,7 @@ public interface ParentsGuildConfig extends Config
         name = "Leaderboard rows",
         description = "How many leaderboard rows to show for each active WOM event.",
         section = womSection,
-        position = 3
+        position = 4
     )
     default int womLeaderboardSize()
     {

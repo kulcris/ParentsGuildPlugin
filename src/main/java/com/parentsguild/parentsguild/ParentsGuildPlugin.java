@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import javax.imageio.ImageIO;
 import javax.inject.Inject;
+import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
@@ -54,7 +55,10 @@ import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.Player;
+import net.runelite.api.Skill;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.events.StatChanged;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.client.Notifier;
@@ -95,6 +99,8 @@ import okhttp3.Response;
 public class ParentsGuildPlugin extends Plugin
 {
     private static final MediaType PNG = MediaType.parse("image/png");
+    private static final MediaType JSON = MediaType.parse("application/json");
+    private static final String WISE_OLD_MAN_PLAYER_API = "https://api.wiseoldman.net/v2/players/";
     private static final DateTimeFormatter CAPTURED_AT_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
         .withZone(ZoneOffset.UTC);
     private static final DateTimeFormatter PANEL_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss 'UTC'")
@@ -161,6 +167,10 @@ public class ParentsGuildPlugin extends Plugin
     private final Map<Integer, Long> completedDropItemDenyCache = new ConcurrentHashMap<>();
     private final Map<Integer, Map<Integer, Integer>> rewardContainerSnapshots = new ConcurrentHashMap<>();
     private final Map<Integer, Long> womWarningMarkers = new ConcurrentHashMap<>();
+    private final Map<String, Long> metricLocalGains = new ConcurrentHashMap<>();
+    private final Map<String, Integer> lastSkillXpByMetricKey = new ConcurrentHashMap<>();
+    private final Map<String, Integer> lastAbsoluteMetricCountByKey = new ConcurrentHashMap<>();
+    private final Set<String> metricWomUpdateReminderTileIds = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean womRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoStatusRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoBoardRefreshInFlight = new AtomicBoolean(false);
@@ -168,6 +178,7 @@ public class ParentsGuildPlugin extends Plugin
     private volatile long dropTileEligibilityCacheAtMillis = 0L;
     private volatile Set<Integer> dropTileEligibilityCache = new HashSet<>();
     private volatile Instant pluginStartedAt = Instant.EPOCH;
+    private volatile String lastLoggedInRsn = "";
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
     private volatile BingoBoardState bingoBoardState = BingoBoardState.hidden();
@@ -199,10 +210,15 @@ public class ParentsGuildPlugin extends Plugin
         completedDropItemDenyCache.clear();
         rewardContainerSnapshots.clear();
         womWarningMarkers.clear();
+        metricLocalGains.clear();
+        metricWomUpdateReminderTileIds.clear();
+        lastSkillXpByMetricKey.clear();
+        lastAbsoluteMetricCountByKey.clear();
         lastConfigWarningAtMillis = 0L;
         dropTileEligibilityCacheAtMillis = 0L;
         dropTileEligibilityCache = new HashSet<>();
         pluginStartedAt = Instant.now();
+        lastLoggedInRsn = "";
         womRefreshInFlight.set(false);
         bingoStatusRefreshInFlight.set(false);
         bingoBoardRefreshInFlight.set(false);
@@ -239,6 +255,11 @@ public class ParentsGuildPlugin extends Plugin
         seenCompletionNotificationIds.clear();
         rewardContainerSnapshots.clear();
         womWarningMarkers.clear();
+        metricLocalGains.clear();
+        metricWomUpdateReminderTileIds.clear();
+        lastSkillXpByMetricKey.clear();
+        lastAbsoluteMetricCountByKey.clear();
+        lastLoggedInRsn = "";
         womRefreshInFlight.set(false);
         bingoStatusRefreshInFlight.set(false);
         bingoBoardRefreshInFlight.set(false);
@@ -307,15 +328,250 @@ public class ParentsGuildPlugin extends Plugin
         if (event.getGameState() == GameState.LOGGED_IN)
         {
             requestLoginInitialSync();
+            lastLoggedInRsn = currentLocalPlayerName();
             return;
         }
 
         if (event.getGameState() == GameState.LOGIN_SCREEN || event.getGameState() == GameState.HOPPING)
         {
+            final String playerRsn = cleanText(lastLoggedInRsn);
+            if (!playerRsn.isEmpty() && config.submitWomRefreshOnLogout())
+            {
+                requestWomPlayerUpdate(playerRsn);
+            }
+            lastLoggedInRsn = "";
             bingoOverlayState = BingoOverlayState.hidden();
             bingoBoardState = BingoBoardState.hidden();
             updateBingoBoardPopup();
         }
+    }
+
+    @Subscribe
+    public void onStatChanged(StatChanged event)
+    {
+        handleStatChanged(event);
+    }
+
+    @Subscribe
+    public void onChatMessage(ChatMessage event)
+    {
+        handleMetricChatMessage(event);
+    }
+
+    private void handleStatChanged(StatChanged event)
+    {
+        if (!config.enableBingoMetricTracking() || client.getGameState() != GameState.LOGGED_IN || event == null)
+        {
+            return;
+        }
+
+        final String skillMetricKey = metricKeyForSkill(event.getSkill());
+        if (skillMetricKey.isEmpty())
+        {
+            return;
+        }
+
+        final int currentXp = Math.max(0, event.getXp());
+        final Integer previousXp = lastSkillXpByMetricKey.put(skillMetricKey, currentXp);
+        if (previousXp == null || currentXp <= previousXp)
+        {
+            return;
+        }
+
+        final long gained = currentXp - previousXp;
+        applyMetricDelta(skillMetricKey, gained, event.getSkill().getName() + " XP");
+        applyMetricDelta("computed:overall_xp", gained, "Overall XP");
+    }
+
+    private void handleMetricChatMessage(ChatMessage event)
+    {
+        if (!config.enableBingoMetricTracking() || client.getGameState() != GameState.LOGGED_IN || event == null)
+        {
+            return;
+        }
+        if (event.getType() != ChatMessageType.GAMEMESSAGE && event.getType() != ChatMessageType.SPAM)
+        {
+            return;
+        }
+
+        final String message = cleanText(event.getMessage());
+        final String normalized = normalizeName(message);
+        if (normalized.startsWith("your ") && normalized.contains(" kill count is:"))
+        {
+            final int nameStart = "your ".length();
+            final int nameEnd = normalized.indexOf(" kill count is:");
+            final String bossName = normalized.substring(nameStart, nameEnd).trim();
+            final int count = parseTrailingCount(normalized.substring(nameEnd + " kill count is:".length()));
+            if (!bossName.isEmpty() && count > 0)
+            {
+                applyAbsoluteMetricCount("boss:" + metricKeySlug(bossName), count, bossName + " KC");
+            }
+            return;
+        }
+
+        if (normalized.startsWith("you have completed ") && normalized.contains(" treasure trail"))
+        {
+            final int count = parseFirstCount(normalized.substring("you have completed ".length()));
+            final String tier = clueTierFromMessage(normalized);
+            if (count > 0 && !tier.isEmpty())
+            {
+                applyAbsoluteMetricCount("activity:clue_scrolls_" + tier, count, tier + " clues");
+            }
+        }
+    }
+
+    private void applyAbsoluteMetricCount(String metricKey, int absoluteCount, String sourceLabel)
+    {
+        final String cleanedMetricKey = cleanText(metricKey);
+        if (cleanedMetricKey.isEmpty() || absoluteCount <= 0)
+        {
+            return;
+        }
+
+        final Integer previousCount = lastAbsoluteMetricCountByKey.put(cleanedMetricKey, absoluteCount);
+        final long gained = previousCount == null || absoluteCount <= previousCount ? 1L : absoluteCount - previousCount;
+        applyMetricDelta(cleanedMetricKey, gained, sourceLabel);
+    }
+
+    private void applyMetricDelta(String metricKey, long gained, String sourceLabel)
+    {
+        if (gained <= 0L)
+        {
+            return;
+        }
+
+        final String playerRsn = currentLocalPlayerName();
+        final String endpoint = resolveBingoMetricEndpoint();
+        if (playerRsn.isEmpty() || endpoint.isEmpty())
+        {
+            return;
+        }
+
+        final List<BingoBoardCell> matchingTiles = activeMetricTiles(metricKey);
+        if (matchingTiles.isEmpty())
+        {
+            return;
+        }
+
+        for (BingoBoardCell cell : matchingTiles)
+        {
+            final String tileId = cleanText(cell.getTileId());
+            if (tileId.isEmpty() || cell.isCompleted() || cell.getTargetValue() <= 0L)
+            {
+                continue;
+            }
+
+            final long localGain = metricLocalGains.merge(tileId, gained, Long::sum);
+            final long pluginProgress = cell.getRequiredCompletions() > 1
+                ? localGain
+                : Math.max(0L, cell.getProgressValue()) + localGain;
+            submitMetricClaim(endpoint, playerRsn, cell, pluginProgress, gained, sourceLabel);
+            maybeRemindWomUpdateRequired(cell, pluginProgress);
+        }
+    }
+
+    private void maybeRemindWomUpdateRequired(BingoBoardCell cell, long pluginProgress)
+    {
+        if (cell == null || pluginProgress < cell.getTargetValue())
+        {
+            return;
+        }
+
+        final String tileId = cleanText(cell.getTileId());
+        if (tileId.isEmpty() || !metricWomUpdateReminderTileIds.add(tileId))
+        {
+            return;
+        }
+
+        sendGameMessage("ParentsGuild: \"" + cell.getLabel() + "\" appears complete locally. Log out and back in so Wise Old Man can update and confirm it.");
+    }
+
+    private List<BingoBoardCell> activeMetricTiles(String metricKey)
+    {
+        final List<BingoBoardCell> tiles = new ArrayList<>();
+        final String cleanedMetricKey = cleanText(metricKey);
+        if (cleanedMetricKey.isEmpty() || !bingoBoardState.isVisible())
+        {
+            return tiles;
+        }
+
+        for (List<BingoBoardCell> row : bingoBoardState.getGrid())
+        {
+            for (BingoBoardCell cell : row)
+            {
+                if (cell != null
+                    && "metric".equals(normalizeName(cell.getTileType()))
+                    && cleanedMetricKey.equals(cleanText(cell.getMetricKey()))
+                    && !cell.isCompleted())
+                {
+                    tiles.add(cell);
+                }
+            }
+        }
+        return tiles;
+    }
+
+    private void submitMetricClaim(String endpoint, String playerRsn, BingoBoardCell cell, long pluginProgress, long localGain, String sourceLabel)
+    {
+        final String achievedAtUtc = CAPTURED_AT_FORMAT.format(Instant.now().truncatedTo(ChronoUnit.SECONDS));
+        final String eventId = buildMetricEventId(playerRsn, cell.getTileId(), cell.getMetricKey(), cell.getTargetValue(), achievedAtUtc);
+        final JsonObject payload = new JsonObject();
+        payload.addProperty("source", "runelite_plugin");
+        payload.addProperty("eventId", eventId);
+        payload.addProperty("playerRsn", playerRsn);
+        payload.addProperty("tileId", cell.getTileId());
+        payload.addProperty("metricKey", cell.getMetricKey());
+        payload.addProperty("metricLabel", firstNonBlank(cell.getMetricLabel(), cell.getLabel(), sourceLabel));
+        payload.addProperty("gainedValue", localGain);
+        payload.addProperty("pluginProgressValue", pluginProgress);
+        payload.addProperty("targetValue", cell.getTargetValue());
+        payload.addProperty("achievedAtUtc", achievedAtUtc);
+
+        final Request request = new Request.Builder()
+            .url(endpoint)
+            .header("Accept", "application/json")
+            .post(RequestBody.create(JSON, gson.toJson(payload)))
+            .build();
+
+        okHttpClient.newCall(request).enqueue(new Callback()
+        {
+            @Override
+            public void onFailure(Call call, IOException e)
+            {
+                log.warn("Bingo metric submission failed", e);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException
+            {
+                try (Response httpResponse = response)
+                {
+                    final String responseBody = httpResponse.body() != null ? httpResponse.body().string() : "";
+                    if (!httpResponse.isSuccessful())
+                    {
+                        log.warn("Bingo metric endpoint returned HTTP {}: {}", httpResponse.code(), responseBody);
+                        return;
+                    }
+
+                    final JsonObject responseJson = parseResponseJson(responseBody);
+                    final String outcome = jsonString(responseJson, "outcome");
+                    if ("approved".equals(outcome))
+                    {
+                        sendGameMessage("ParentsGuild: WOM confirmed \"" + firstNonBlank(jsonString(responseJson, "tileLabel"), cell.getLabel()) + "\".");
+                        requestBingoStatusRefresh(true);
+                        requestBingoBoardRefresh(true);
+                        return;
+                    }
+                    if ("submitted".equals(outcome))
+                    {
+                        requestBingoStatusRefresh(true);
+                        requestBingoBoardRefresh(true);
+                        return;
+                    }
+                    debugLog("Quiet bingo metric outcome={} tile={} response={}", outcome, cell.getLabel(), responseBody);
+                }
+            }
+        });
     }
 
     @Subscribe
@@ -348,7 +604,7 @@ public class ParentsGuildPlugin extends Plugin
     {
         requestLoginSyncAttempt();
 
-        if (womExecutor == null || (!config.showBingoOverlay() && !config.enableBingoDrops()))
+        if (womExecutor == null || (!config.showBingoOverlay() && !config.enableBingoDrops() && !config.enableBingoMetricTracking()))
         {
             return;
         }
@@ -368,11 +624,13 @@ public class ParentsGuildPlugin extends Plugin
 
     private void requestLoginSyncAttempt()
     {
-        if (currentLocalPlayerName().isEmpty())
+        final String playerName = currentLocalPlayerName();
+        if (playerName.isEmpty())
         {
             debugLog("Skipping login sync attempt because local player name is not available yet.");
             return;
         }
+        lastLoggedInRsn = playerName;
         requestWomRefresh(true);
         requestBingoStatusRefresh(true);
         requestBingoBoardRefresh(true);
@@ -635,7 +893,7 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        if (!bingoBoardOverlayEnabled)
+        if (!bingoBoardOverlayEnabled && !config.enableBingoMetricTracking())
         {
             bingoBoardState = BingoBoardState.hidden();
             updateBingoBoardPopup();
@@ -779,7 +1037,7 @@ public class ParentsGuildPlugin extends Plugin
             bingoBoardTask = null;
         }
 
-        if (womExecutor == null || !bingoBoardOverlayEnabled)
+        if (womExecutor == null || (!bingoBoardOverlayEnabled && !config.enableBingoMetricTracking()))
         {
             return;
         }
@@ -1171,24 +1429,6 @@ public class ParentsGuildPlugin extends Plugin
         return itemIds;
     }
 
-    private static int firstMultiItemTileItemId(JsonObject tile)
-    {
-        for (JsonElement itemElement : jsonArray(tile, "multiItems"))
-        {
-            if (!itemElement.isJsonObject())
-            {
-                continue;
-            }
-
-            final int itemId = jsonInt(itemElement.getAsJsonObject(), "itemId");
-            if (itemId > 0)
-            {
-                return itemId;
-            }
-        }
-        return 0;
-    }
-
     private static String multiItemTileLabel(JsonObject tile)
     {
         final List<String> labels = new ArrayList<>();
@@ -1219,6 +1459,33 @@ public class ParentsGuildPlugin extends Plugin
             return labels.get(0);
         }
         return labels.get(0) + " / " + labels.get(1) + (labels.size() > 2 ? " +" + (labels.size() - 2) : "");
+    }
+
+    private static List<BingoBoardItem> parseMultiItemTileItems(JsonObject tile)
+    {
+        final List<BingoBoardItem> items = new ArrayList<>();
+        for (JsonElement itemElement : jsonArray(tile, "multiItems"))
+        {
+            if (!itemElement.isJsonObject())
+            {
+                continue;
+            }
+
+            final JsonObject item = itemElement.getAsJsonObject();
+            final int itemId = jsonInt(item, "itemId");
+            if (itemId <= 0)
+            {
+                continue;
+            }
+            final String itemName = firstNonBlank(
+                jsonString(item, "itemName"),
+                jsonString(item, "label"),
+                jsonString(item, "pageTitle"),
+                "Item " + itemId
+            );
+            items.add(new BingoBoardItem(itemId, itemName));
+        }
+        return items;
     }
 
     private void rememberCompletedDropItem(int itemId)
@@ -1340,6 +1607,12 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
+        final BingoBoardItem selectedItem = selectProofItem(cell);
+        if (selectedItem == null)
+        {
+            return;
+        }
+
         final String capturedAtUtc = CAPTURED_AT_FORMAT.format(Instant.now().truncatedTo(ChronoUnit.SECONDS));
         final String eventId = buildProofEventId(playerRsn, cell.getTileId(), capturedAtUtc);
         notifier.notify("ParentsGuild: capturing proof for \"" + cell.getLabel() + "\".");
@@ -1353,7 +1626,7 @@ public class ParentsGuildPlugin extends Plugin
                 }
 
                 final byte[] screenshotBytes = toPngBytes(image);
-                submitTileProof(endpoint, playerRsn, cell, eventId, capturedAtUtc, screenshotBytes);
+                submitTileProof(endpoint, playerRsn, cell, selectedItem, eventId, capturedAtUtc, screenshotBytes);
             }
             catch (IOException ex)
             {
@@ -1362,15 +1635,51 @@ public class ParentsGuildPlugin extends Plugin
         });
     }
 
-    private void submitTileProof(String endpoint, String playerRsn, BingoBoardCell cell, String eventId, String capturedAtUtc, byte[] screenshotBytes)
+    private BingoBoardItem selectProofItem(BingoBoardCell cell)
     {
-        final MultipartBody body = new MultipartBody.Builder()
+        if (!"multi_item".equals(normalizeName(cell.getTileType())))
+        {
+            return new BingoBoardItem(0, "");
+        }
+        final List<BingoBoardItem> items = cell.getMultiItems();
+        if (items == null || items.isEmpty())
+        {
+            notifier.notify("ParentsGuild: this multi item tile has no selectable items.");
+            return null;
+        }
+        if (items.size() == 1)
+        {
+            return items.get(0);
+        }
+
+        final Object selected = JOptionPane.showInputDialog(
+            null,
+            "Item being submitted",
+            "ParentsGuild Bingo Proof",
+            JOptionPane.PLAIN_MESSAGE,
+            null,
+            items.toArray(),
+            items.get(0)
+        );
+        return selected instanceof BingoBoardItem ? (BingoBoardItem) selected : null;
+    }
+
+    private void submitTileProof(String endpoint, String playerRsn, BingoBoardCell cell, BingoBoardItem selectedItem, String eventId, String capturedAtUtc, byte[] screenshotBytes)
+    {
+        final MultipartBody.Builder bodyBuilder = new MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("source", "runelite_plugin")
             .addFormDataPart("eventId", eventId)
             .addFormDataPart("playerRsn", playerRsn)
             .addFormDataPart("tileId", cell.getTileId())
-            .addFormDataPart("capturedAtUtc", capturedAtUtc)
+            .addFormDataPart("capturedAtUtc", capturedAtUtc);
+        if (selectedItem != null && selectedItem.getItemId() > 0)
+        {
+            bodyBuilder
+                .addFormDataPart("itemId", Integer.toString(selectedItem.getItemId()))
+                .addFormDataPart("itemName", selectedItem.getItemName());
+        }
+        final MultipartBody body = bodyBuilder
             .addFormDataPart("proof", "parentsguild-bingo-proof.png", RequestBody.create(PNG, screenshotBytes))
             .build();
 
@@ -1576,6 +1885,12 @@ public class ParentsGuildPlugin extends Plugin
         return base.isEmpty() ? "" : base + "/api/integrations/bingo-proof.php";
     }
 
+    private String resolveBingoMetricEndpoint()
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() ? "" : base + "/api/integrations/bingo-metric.php";
+    }
+
     private String resolveBingoStatusEndpoint()
     {
         final String base = resolveEndpointBase(config.websiteBaseUrl());
@@ -1592,6 +1907,43 @@ public class ParentsGuildPlugin extends Plugin
     {
         final String base = resolveEndpointBase(config.websiteBaseUrl());
         return base.isEmpty() ? "" : base + "/api/integrations/clan-panel.php";
+    }
+
+    private void requestWomPlayerUpdate(String playerRsn)
+    {
+        if (womExecutor == null)
+        {
+            return;
+        }
+
+        final String cleanedRsn = cleanText(playerRsn);
+        if (cleanedRsn.isEmpty())
+        {
+            return;
+        }
+
+        womExecutor.execute(() -> {
+            final String url = WISE_OLD_MAN_PLAYER_API + urlEncode(cleanedRsn).replace("+", "%20");
+            final Request request = new Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .post(RequestBody.create(JSON, "{}"))
+                .build();
+            try (Response response = okHttpClient.newCall(request).execute())
+            {
+                final String body = response.body() != null ? response.body().string() : "";
+                if (!response.isSuccessful())
+                {
+                    log.warn("WOM player update failed for {} with HTTP {}: {}", cleanedRsn, response.code(), body);
+                    return;
+                }
+                debugLog("WOM player update triggered for {}", cleanedRsn);
+            }
+            catch (IOException | RuntimeException ex)
+            {
+                log.warn("Failed to trigger WOM player update for {}", cleanedRsn, ex);
+            }
+        });
     }
 
     // Clan panel payload parsing
@@ -2079,6 +2431,15 @@ public class ParentsGuildPlugin extends Plugin
                         jsonBoolean(tile, "isCompleted"),
                         jsonBoolean(tile, "pendingClaim"),
                         jsonString(tile, "tileType"),
+                        jsonString(tile, "metricKey"),
+                        jsonString(tile, "metricLabel"),
+                        Math.max(0L, jsonLong(tile, "progressValue")),
+                        Math.max(0L, jsonLong(tile, "pendingProgressValue")),
+                        Math.max(0L, jsonLong(tile, "targetValue")),
+                        Math.max(1, jsonInt(tile, "requiredCompletions")),
+                        Math.max(0, jsonInt(tile, "approvedCompletions")),
+                        Math.max(0, jsonInt(tile, "pendingCompletions")),
+                        parseMultiItemTileItems(tile),
                         boardTileImage(endpoint, tile)
                     ));
                 }
@@ -2127,8 +2488,13 @@ public class ParentsGuildPlugin extends Plugin
         final int pendingCompletions = Math.max(0, jsonInt(tile, "pendingCompletions"));
         final int requiredCompletions = Math.max(1, jsonInt(tile, "requiredCompletions"));
         final String tileType = normalizeName(jsonString(tile, "tileType"));
-        if (requiredCompletions > 1 && ("manual".equals(tileType) || "drop".equals(tileType) || "multi_item".equals(tileType)))
+        if (("manual".equals(tileType) || "drop".equals(tileType) || "multi_item".equals(tileType))
+            && (requiredCompletions > 1 || "drop".equals(tileType) || "multi_item".equals(tileType)))
         {
+            if (pendingCompletions <= 0 && requiredCompletions <= 1)
+            {
+                return Math.min(approvedCompletions, requiredCompletions) + "/" + requiredCompletions;
+            }
             return Math.min(approvedCompletions, requiredCompletions) + "(+" + pendingCompletions + ")/" + requiredCompletions;
         }
 
@@ -2136,7 +2502,15 @@ public class ParentsGuildPlugin extends Plugin
         if ("metric".equals(tileType) && targetValue > 0L)
         {
             final long progressValue = Math.max(0L, jsonLong(tile, "progressValue"));
+            final long pendingProgressValue = Math.min(
+                Math.max(0L, jsonLong(tile, "pendingProgressValue")),
+                Math.max(0L, targetValue - Math.min(progressValue, targetValue))
+            );
             final String suffix = metricProgressSuffix(jsonString(tile, "metricLabel"));
+            if (pendingProgressValue > 0L)
+            {
+                return compactMetricValue(Math.min(progressValue, targetValue)) + "(+" + compactMetricValue(pendingProgressValue) + ")/" + compactMetricValue(targetValue) + suffix;
+            }
             return compactMetricValue(Math.min(progressValue, targetValue)) + "/" + compactMetricValue(targetValue) + suffix;
         }
 
@@ -2167,11 +2541,18 @@ public class ParentsGuildPlugin extends Plugin
 
     private BufferedImage boardTileImage(String endpoint, JsonObject tile)
     {
-        int itemId = jsonInt(tile, "dropItemId");
-        if (itemId <= 0 && "multi_item".equals(normalizeName(jsonString(tile, "tileType"))))
+        final String tileId = cleanText(jsonString(tile, "id"));
+        if (!tileId.isEmpty() && !cleanText(jsonString(tile, "backgroundImageStorageName")).isEmpty())
         {
-            itemId = firstMultiItemTileItemId(tile);
+            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId)));
         }
+
+        if ("multi_item".equals(normalizeName(jsonString(tile, "tileType"))))
+        {
+            return multiItemTileImage(tile);
+        }
+
+        int itemId = jsonInt(tile, "dropItemId");
         if (itemId > 0)
         {
             try
@@ -2185,12 +2566,6 @@ public class ParentsGuildPlugin extends Plugin
             return null;
         }
 
-        final String tileId = cleanText(jsonString(tile, "id"));
-        if (!tileId.isEmpty() && !cleanText(jsonString(tile, "backgroundImageStorageName")).isEmpty())
-        {
-            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId)));
-        }
-
         final String metricKey = cleanText(jsonString(tile, "metricKey"));
         if ("metric".equals(normalizeName(jsonString(tile, "tileType"))) && metricKey.startsWith("boss:"))
         {
@@ -2198,6 +2573,90 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         return null;
+    }
+
+    private BufferedImage multiItemTileImage(JsonObject tile)
+    {
+        final List<BufferedImage> images = new ArrayList<>();
+        for (JsonElement itemElement : jsonArray(tile, "multiItems"))
+        {
+            if (!itemElement.isJsonObject())
+            {
+                continue;
+            }
+            final int itemId = jsonInt(itemElement.getAsJsonObject(), "itemId");
+            if (itemId <= 0)
+            {
+                continue;
+            }
+            try
+            {
+                final BufferedImage image = itemManager.getImage(itemId);
+                if (image != null)
+                {
+                    images.add(image);
+                }
+            }
+            catch (RuntimeException ex)
+            {
+                debugLog("RuneLite item image failed for multi item {}: {}", itemId, ex.getMessage());
+            }
+            if (images.size() >= 4)
+            {
+                break;
+            }
+        }
+
+        if (images.isEmpty())
+        {
+            return null;
+        }
+        if (images.size() == 1)
+        {
+            return images.get(0);
+        }
+
+        final int canvasSize = 96;
+        final int slotSize = images.size() <= 2 ? 58 : 44;
+        final BufferedImage combined = new BufferedImage(canvasSize, canvasSize, BufferedImage.TYPE_INT_ARGB);
+        final Graphics2D graphics = combined.createGraphics();
+        try
+        {
+            graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
+            for (int index = 0; index < images.size(); index++)
+            {
+                final BufferedImage image = images.get(index);
+                final int slotX;
+                final int slotY;
+                if (images.size() == 2)
+                {
+                    slotX = index == 0 ? 8 : 40;
+                    slotY = index == 0 ? 22 : 34;
+                }
+                else
+                {
+                    slotX = 8 + (index % 2) * 40;
+                    slotY = 8 + (index / 2) * 40;
+                }
+                drawScaledImage(graphics, image, slotX, slotY, slotSize, slotSize);
+            }
+        }
+        finally
+        {
+            graphics.dispose();
+        }
+        return combined;
+    }
+
+    private static void drawScaledImage(Graphics2D graphics, BufferedImage image, int x, int y, int width, int height)
+    {
+        final double scale = Math.min(width / (double) image.getWidth(), height / (double) image.getHeight());
+        final int drawWidth = Math.max(1, (int) Math.ceil(image.getWidth() * scale));
+        final int drawHeight = Math.max(1, (int) Math.ceil(image.getHeight() * scale));
+        final int drawX = x + ((width - drawWidth) / 2);
+        final int drawY = y + ((height - drawHeight) / 2);
+        graphics.drawImage(image, drawX, drawY, drawWidth, drawHeight, null);
     }
 
     // Image loading
@@ -2388,6 +2847,112 @@ public class ParentsGuildPlugin extends Plugin
             capturedAtUtc,
             UUID.randomUUID().toString()
         ));
+    }
+
+    private static String buildMetricEventId(String playerRsn, String tileId, String metricKey, long targetValue, String achievedAtUtc)
+    {
+        return sha1(String.join("|",
+            "metric",
+            playerRsn.toLowerCase(Locale.US),
+            cleanText(tileId).toLowerCase(Locale.US),
+            cleanText(metricKey).toLowerCase(Locale.US),
+            Long.toString(Math.max(0L, targetValue)),
+            achievedAtUtc,
+            UUID.randomUUID().toString()
+        ));
+    }
+
+    private static String metricKeyForSkill(Skill skill)
+    {
+        if (skill == null)
+        {
+            return "";
+        }
+
+        final String name = normalizeName(skill.getName()).replace(' ', '_');
+        if (name.isEmpty())
+        {
+            return "";
+        }
+        return "skill:" + ("runecraft".equals(name) ? "runecrafting" : name);
+    }
+
+    private static String metricKeySlug(String value)
+    {
+        final StringBuilder builder = new StringBuilder();
+        boolean previousUnderscore = false;
+        for (char character : normalizeName(value).toCharArray())
+        {
+            if (Character.isLetterOrDigit(character))
+            {
+                builder.append(character);
+                previousUnderscore = false;
+            }
+            else if (!previousUnderscore)
+            {
+                builder.append('_');
+                previousUnderscore = true;
+            }
+        }
+        int length = builder.length();
+        while (length > 0 && builder.charAt(length - 1) == '_')
+        {
+            builder.deleteCharAt(length - 1);
+            length--;
+        }
+        return builder.toString();
+    }
+
+    private static int parseFirstCount(String value)
+    {
+        final String cleaned = cleanText(value);
+        final StringBuilder digits = new StringBuilder();
+        for (int index = 0; index < cleaned.length(); index++)
+        {
+            final char character = cleaned.charAt(index);
+            if (Character.isDigit(character))
+            {
+                digits.append(character);
+            }
+            else if (character == ',')
+            {
+                continue;
+            }
+            else if (digits.length() > 0)
+            {
+                break;
+            }
+        }
+        return parsePositiveInt(digits.toString());
+    }
+
+    private static int parseTrailingCount(String value)
+    {
+        return parseFirstCount(value);
+    }
+
+    private static int parsePositiveInt(String value)
+    {
+        try
+        {
+            return Math.max(0, Integer.parseInt(cleanText(value)));
+        }
+        catch (RuntimeException ex)
+        {
+            return 0;
+        }
+    }
+
+    private static String clueTierFromMessage(String normalizedMessage)
+    {
+        for (String tier : List.of("beginner", "easy", "medium", "hard", "elite", "master"))
+        {
+            if (normalizedMessage.contains(" " + tier + " treasure trail"))
+            {
+                return tier;
+            }
+        }
+        return "";
     }
 
     private static Instant parseServerUtcInstant(String value)
@@ -2832,6 +3397,19 @@ public class ParentsGuildPlugin extends Plugin
     }
 
     @Value
+    static class BingoBoardItem
+    {
+        int itemId;
+        String itemName;
+
+        @Override
+        public String toString()
+        {
+            return itemName;
+        }
+    }
+
+    @Value
     static class BingoBoardCell
     {
         String tileId;
@@ -2840,6 +3418,15 @@ public class ParentsGuildPlugin extends Plugin
         boolean completed;
         boolean pending;
         String tileType;
+        String metricKey;
+        String metricLabel;
+        long progressValue;
+        long pendingProgressValue;
+        long targetValue;
+        int requiredCompletions;
+        int approvedCompletions;
+        int pendingCompletions;
+        List<BingoBoardItem> multiItems;
         BufferedImage backgroundImage;
     }
 
