@@ -110,6 +110,7 @@ class ParentsGuildBoardPopup extends JFrame
             this.plugin = plugin;
             setBackground(BACKGROUND);
             setBorder(BorderFactory.createEmptyBorder(PANEL_PADDING, PANEL_PADDING, PANEL_PADDING, PANEL_PADDING));
+            setToolTipText("Submit manual screenshot proof");
             final MouseAdapter mouseAdapter = new MouseAdapter()
             {
                 @Override
@@ -145,6 +146,14 @@ class ParentsGuildBoardPopup extends JFrame
             state = nextState == null ? ParentsGuildPlugin.BingoBoardState.hidden() : nextState;
             revalidate();
             repaint();
+        }
+
+        @Override
+        public String getToolTipText(MouseEvent event)
+        {
+            return cellForProofButton(event.getX(), event.getY()) == null
+                ? null
+                : "Submit manual screenshot proof";
         }
 
         @Override

@@ -46,15 +46,6 @@ class ParentsGuildPanel extends PluginPanel
     private static final Color MUTED = new Color(178, 173, 157);
     private static final Color GREEN_GLOW = new Color(72, 204, 94);
     private static final ZoneId LOCAL_ZONE = ZoneId.systemDefault();
-    private static final Locale LOCAL_LOCALE = Locale.getDefault();
-    private static final DateTimeFormatter LOCAL_TIME_FORMAT = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
-        .withLocale(LOCAL_LOCALE)
-        .withZone(LOCAL_ZONE);
-    private static final DateTimeFormatter CALENDAR_DAY_FORMAT = localizedMonthDayFormatter()
-        .withZone(LOCAL_ZONE);
-    private static final DateTimeFormatter CALENDAR_TIME_FORMAT = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)
-        .withLocale(LOCAL_LOCALE)
-        .withZone(LOCAL_ZONE);
     private final ParentsGuildPlugin plugin;
     private final JButton refreshButton = new JButton("Refresh");
     private final JButton boardButton = new JButton("Open Board");
@@ -102,17 +93,6 @@ class ParentsGuildPanel extends PluginPanel
 
         add(header, BorderLayout.NORTH);
         add(tabs, BorderLayout.CENTER);
-    }
-
-    private static DateTimeFormatter localizedMonthDayFormatter()
-    {
-        final String sample = DateTimeFormatter.ofLocalizedDate(FormatStyle.SHORT)
-            .withLocale(LOCAL_LOCALE)
-            .format(LocalDate.of(2026, 11, 22));
-        final int monthIndex = sample.indexOf("11");
-        final int dayIndex = sample.indexOf("22");
-        final String pattern = dayIndex >= 0 && monthIndex >= 0 && dayIndex < monthIndex ? "d/M" : "M/d";
-        return DateTimeFormatter.ofPattern(pattern).withLocale(LOCAL_LOCALE);
     }
 
     // Panel refresh
@@ -402,7 +382,14 @@ class ParentsGuildPanel extends PluginPanel
             endsAt = startsAt.plus(2, ChronoUnit.HOURS);
         }
         final String status = eventStatusLabel(event);
-        final CompactEventTimePanel panel = new CompactEventTimePanel(startsAt, endsAt, eventAccent(status));
+        final CompactEventTimePanel panel = new CompactEventTimePanel(
+            startsAt,
+            endsAt,
+            eventAccent(status),
+            "Ongoing".equals(status),
+            plugin.useDayFirstDates(),
+            plugin.useTwentyFourHourTime()
+        );
         panel.setAlignmentX(LEFT_ALIGNMENT);
         panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 70));
         return panel;
@@ -823,8 +810,7 @@ class ParentsGuildPanel extends PluginPanel
 
     private static boolean isWeeklyEvent(ParentsGuildPlugin.UpcomingEventState event)
     {
-        final String text = normalizeMatchText(event.getTitle() + " " + event.getType() + " " + event.getSource() + " " + event.getStatus() + " " + event.getDescription());
-        return text.contains("weekly") || text.contains("week") || text.contains("sotw") || text.contains("botw");
+        return event.isRecurring() && event.getRecurrenceFrequency() == 2;
     }
 
     private static Instant parseEventInstant(String value)
@@ -850,10 +836,12 @@ class ParentsGuildPanel extends PluginPanel
         }
     }
 
-    private static String formatDateTime(String value)
+    private String formatDateTime(String value)
     {
         final Instant instant = parseEventInstant(value);
-        return instant == null ? (value == null || value.trim().isEmpty() ? "-" : value) : LOCAL_TIME_FORMAT.format(instant);
+        return instant == null
+            ? (value == null || value.trim().isEmpty() ? "-" : value)
+            : ParentsGuildDateTimeFormatter.formatDateTime(instant, plugin.useDayFirstDates(), plugin.useTwentyFourHourTime());
     }
 
     private static Color eventAccent(String status)
@@ -960,15 +948,21 @@ class ParentsGuildPanel extends PluginPanel
         private final Instant startsAt;
         private final Instant endsAt;
         private final Color color;
+        private final boolean ongoing;
+        private final boolean dayFirstDates;
+        private final boolean twentyFourHourTime;
         private final ZonedDateTime visibleStart;
         private final ZonedDateTime visibleEnd;
 
-        CompactEventTimePanel(Instant startsAt, Instant endsAt, Color color)
+        CompactEventTimePanel(Instant startsAt, Instant endsAt, Color color, boolean ongoing, boolean dayFirstDates, boolean twentyFourHourTime)
         {
             this.startsAt = startsAt;
             this.endsAt = endsAt;
             this.color = color == null ? HIGHLIGHT : color;
-            this.visibleStart = LocalDate.now(LOCAL_ZONE).atStartOfDay(LOCAL_ZONE);
+            this.ongoing = ongoing;
+            this.dayFirstDates = dayFirstDates;
+            this.twentyFourHourTime = twentyFourHourTime;
+            this.visibleStart = ZonedDateTime.now(LOCAL_ZONE).truncatedTo(ChronoUnit.MINUTES);
             this.visibleEnd = visibleStart.plusDays(VISIBLE_DAYS);
             setPreferredSize(new Dimension(185, 70));
             setMinimumSize(new Dimension(150, 70));
@@ -990,8 +984,8 @@ class ParentsGuildPanel extends PluginPanel
 
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
             g.setColor(MUTED);
-            g.drawString("Start " + CALENDAR_TIME_FORMAT.format(startsAt), left, 14);
-            g.drawString("End " + CALENDAR_TIME_FORMAT.format(endsAt), left, 29);
+            g.drawString("Start " + ParentsGuildDateTimeFormatter.formatDateTime(startsAt, dayFirstDates, twentyFourHourTime), left, 14);
+            g.drawString("End " + ParentsGuildDateTimeFormatter.formatDateTime(endsAt, dayFirstDates, twentyFourHourTime), left, 29);
 
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 9));
             for (int day = 0; day <= VISIBLE_DAYS; day++)
@@ -1003,7 +997,7 @@ class ParentsGuildPanel extends PluginPanel
                 {
                     g.setColor(MUTED);
                     final int labelX = Math.min(Math.max(left, x - 6), Math.max(left, right - 22));
-                    g.drawString(CALENDAR_DAY_FORMAT.format(visibleStart.plusDays(day)), labelX, 47);
+                    g.drawString(ParentsGuildDateTimeFormatter.calendarDayFormatter(dayFirstDates).format(visibleStart.plusDays(day)), labelX, 47);
                 }
             }
 
@@ -1011,11 +1005,22 @@ class ParentsGuildPanel extends PluginPanel
             g.setColor(new Color(58, 58, 58));
             g.drawLine(left, barY, right, barY);
             g.setColor(color);
-            final int x1 = xForInstant(startsAt, left, right);
+            final Instant now = Instant.now();
+            final Instant displayStart = ongoing && now.isAfter(startsAt) ? now : startsAt;
+            final int x1 = xForInstant(displayStart, left, right);
             final int x2 = Math.max(x1 + 4, xForInstant(endsAt, left, right));
             if (x2 >= left && x1 <= right)
             {
                 g.drawLine(Math.max(left, x1), barY, Math.min(right, x2), barY);
+            }
+            if (ongoing)
+            {
+                final int nowX = xForInstant(now, left, right);
+                g.setStroke(new BasicStroke(1F));
+                g.setColor(new Color(236, 222, 174));
+                g.drawLine(nowX, 50, nowX, 64);
+                g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 8));
+                g.drawString("Now", Math.min(Math.max(left, nowX - 9), Math.max(left, right - 18)), 53);
             }
             g.dispose();
         }

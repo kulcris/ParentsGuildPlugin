@@ -103,8 +103,6 @@ public class ParentsGuildPlugin extends Plugin
     private static final String WISE_OLD_MAN_PLAYER_API = "https://api.wiseoldman.net/v2/players/";
     private static final DateTimeFormatter CAPTURED_AT_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
         .withZone(ZoneOffset.UTC);
-    private static final DateTimeFormatter PANEL_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss 'UTC'")
-        .withZone(ZoneOffset.UTC);
     private static final DateTimeFormatter SERVER_UTC_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
         .withZone(ZoneOffset.UTC);
     private static final long RECENT_EVENT_TTL_MILLIS = 30_000L;
@@ -1980,7 +1978,7 @@ public class ParentsGuildPlugin extends Plugin
             ? "No active WOM events."
             : competitions.size() + " active WOM event" + (competitions.size() == 1 ? "" : "s") + ".";
         final String detail = womEvents.getDetailMessage().isEmpty()
-            ? "Last updated " + PANEL_TIME_FORMAT.format(Instant.now())
+            ? "Last updated " + formatDisplayDateTime(Instant.now())
             : womEvents.getDetailMessage();
 
         return new WomPanelState(false, statusMessage, detail, profile, bingo, announcement, quickLinks, upcomingEvents, competitions);
@@ -2096,9 +2094,11 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String lastRefreshedAt = jsonString(womEvents, "lastRefreshedAtUtc");
+        final Instant lastRefreshedInstant = parseServerUtcInstant(lastRefreshedAt);
+        final String lastRefreshedDisplay = lastRefreshedInstant == null ? lastRefreshedAt : formatDisplayDateTime(lastRefreshedInstant);
         final String detail = firstNonBlank(
-            jsonBoolean(womEvents, "stale") && !lastRefreshedAt.isEmpty() ? "Cached WOM data is stale. Last refreshed " + lastRefreshedAt : "",
-            !lastRefreshedAt.isEmpty() ? "WOM cache refreshed " + lastRefreshedAt : ""
+            jsonBoolean(womEvents, "stale") && !lastRefreshedDisplay.isEmpty() ? "Cached WOM data is stale. Last refreshed " + lastRefreshedDisplay : "",
+            !lastRefreshedDisplay.isEmpty() ? "WOM cache refreshed " + lastRefreshedDisplay : ""
         );
         return new WomEventsPayload(
             jsonString(womEvents, "status"),
@@ -2185,7 +2185,9 @@ public class ParentsGuildPlugin extends Plugin
                 jsonString(object, "description"),
                 jsonString(object, "location"),
                 jsonString(object, "status"),
-                Math.max(0, jsonInt(object, "interestedCount"))
+                Math.max(0, jsonInt(object, "interestedCount")),
+                jsonBoolean(object, "isRecurring"),
+                jsonInt(object, "recurrenceFrequency")
             ));
         }
         return results;
@@ -2544,7 +2546,9 @@ public class ParentsGuildPlugin extends Plugin
         final String tileId = cleanText(jsonString(tile, "id"));
         if (!tileId.isEmpty() && !cleanText(jsonString(tile, "backgroundImageStorageName")).isEmpty())
         {
-            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId)));
+            final String updatedAt = cleanText(jsonString(tile, "backgroundImageUpdatedAt"));
+            final String version = updatedAt.isEmpty() ? "" : "&v=" + urlEncode(updatedAt);
+            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId) + version));
         }
 
         if ("multi_item".equals(normalizeName(jsonString(tile, "tileType"))))
@@ -2748,6 +2752,21 @@ public class ParentsGuildPlugin extends Plugin
     BingoOverlayState getBingoOverlayState()
     {
         return bingoOverlayState;
+    }
+
+    boolean useDayFirstDates()
+    {
+        return config.dayFirstDates();
+    }
+
+    boolean useTwentyFourHourTime()
+    {
+        return config.twentyFourHourTime();
+    }
+
+    private String formatDisplayDateTime(Instant instant)
+    {
+        return ParentsGuildDateTimeFormatter.formatDateTime(instant, useDayFirstDates(), useTwentyFourHourTime());
     }
 
     BingoBoardState getBingoBoardState()
@@ -3341,6 +3360,8 @@ public class ParentsGuildPlugin extends Plugin
         String location;
         String status;
         int interestedCount;
+        boolean recurring;
+        int recurrenceFrequency;
     }
 
     @Value

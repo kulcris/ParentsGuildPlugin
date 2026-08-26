@@ -23,6 +23,13 @@ public interface ParentsGuildConfig extends Config
     )
     String womSection = "wom";
 
+    @ConfigSection(
+        name = "Display",
+        description = "Date and time display preferences.",
+        position = 3
+    )
+    String displaySection = "display";
+
     @ConfigItem(
         keyName = "websiteBaseUrl",
         name = "Website base URL",
@@ -149,6 +156,30 @@ public interface ParentsGuildConfig extends Config
     default int womLeaderboardSize()
     {
         return 10;
+    }
+
+    @ConfigItem(
+        keyName = "dayFirstDates",
+        name = "Use DD/MM/YY dates",
+        description = "Display dates in DD/MM/YY format instead of your system date order.",
+        section = displaySection,
+        position = 0
+    )
+    default boolean dayFirstDates()
+    {
+        return false;
+    }
+
+    @ConfigItem(
+        keyName = "twentyFourHourTime",
+        name = "Use 24-hour time",
+        description = "Display times with a 24-hour clock instead of AM/PM.",
+        section = displaySection,
+        position = 1
+    )
+    default boolean twentyFourHourTime()
+    {
+        return false;
     }
 
     @ConfigItem(
