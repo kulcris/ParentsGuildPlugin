@@ -33,7 +33,7 @@ public interface ParentsGuildConfig extends Config
     @ConfigItem(
         keyName = "websiteBaseUrl",
         name = "Website base URL",
-        description = "The clan website URL,
+        description = "The clan website URL",
         position = 0
     )
     default String websiteBaseUrl()
