@@ -58,6 +58,7 @@ import net.runelite.api.Player;
 import net.runelite.api.Skill;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.StatChanged;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.InterfaceID;
@@ -69,7 +70,6 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.events.NpcLootReceived;
-import net.runelite.client.events.PlayerLootReceived;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.game.ItemStack;
 import net.runelite.client.plugins.Plugin;
@@ -111,6 +111,7 @@ public class ParentsGuildPlugin extends Plugin
     private static final long DROP_TILE_ELIGIBILITY_CACHE_MILLIS = 10_000L;
     private static final long COMPLETED_DROP_DENY_CACHE_MILLIS = TimeUnit.MINUTES.toMillis(10);
     private static final long WOM_HTTP_TIMEOUT_WARNING_MILLIS = 20_000L;
+    private static final long NPC_INVENTORY_REWARD_WINDOW_MILLIS = TimeUnit.SECONDS.toMillis(12);
     private static final int BINGO_STATUS_REFRESH_SECONDS = 60;
     private static final int[] LOGIN_SYNC_DELAYS_SECONDS = {1, 3, 6};
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
@@ -165,6 +166,7 @@ public class ParentsGuildPlugin extends Plugin
     private final Map<String, BufferedImage> bingoBoardImageCache = new ConcurrentHashMap<>();
     private final Map<Integer, Long> completedDropItemDenyCache = new ConcurrentHashMap<>();
     private final Map<Integer, Map<Integer, Integer>> rewardContainerSnapshots = new ConcurrentHashMap<>();
+    private final Map<Integer, Integer> inventorySnapshot = new LinkedHashMap<>();
     private final Map<Integer, Long> womWarningMarkers = new ConcurrentHashMap<>();
     private final Map<String, Long> metricLocalGains = new ConcurrentHashMap<>();
     private final Map<String, Integer> lastSkillXpByMetricKey = new ConcurrentHashMap<>();
@@ -179,6 +181,8 @@ public class ParentsGuildPlugin extends Plugin
     private volatile Set<Integer> dropTileEligibilityCache = new HashSet<>();
     private volatile Instant pluginStartedAt = Instant.EPOCH;
     private volatile String lastLoggedInRsn = "";
+    private volatile NpcInventoryRewardInteraction pendingNpcInventoryRewardInteraction;
+    private volatile boolean inventorySnapshotInitialized;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
     private volatile BingoBoardState bingoBoardState = BingoBoardState.hidden();
@@ -209,6 +213,9 @@ public class ParentsGuildPlugin extends Plugin
         bingoBoardImageCache.clear();
         completedDropItemDenyCache.clear();
         rewardContainerSnapshots.clear();
+        inventorySnapshot.clear();
+        pendingNpcInventoryRewardInteraction = null;
+        inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
         metricWomUpdateReminderTileIds.clear();
@@ -255,6 +262,9 @@ public class ParentsGuildPlugin extends Plugin
         seenSubmissionNotificationIds.clear();
         seenCompletionNotificationIds.clear();
         rewardContainerSnapshots.clear();
+        inventorySnapshot.clear();
+        pendingNpcInventoryRewardInteraction = null;
+        inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
         metricWomUpdateReminderTileIds.clear();
@@ -336,6 +346,9 @@ public class ParentsGuildPlugin extends Plugin
 
         if (event.getGameState() == GameState.LOGIN_SCREEN || event.getGameState() == GameState.HOPPING)
         {
+            inventorySnapshot.clear();
+            pendingNpcInventoryRewardInteraction = null;
+            inventorySnapshotInitialized = false;
             final String playerRsn = cleanText(lastLoggedInRsn);
             if (!playerRsn.isEmpty() && config.submitWomRefreshOnLogout())
             {
@@ -583,15 +596,33 @@ public class ParentsGuildPlugin extends Plugin
     }
 
     @Subscribe
-    public void onPlayerLootReceived(PlayerLootReceived event)
+    public void onMenuOptionClicked(MenuOptionClicked event)
     {
-        handleLoot(event.getPlayer() != null ? event.getPlayer().getName() : "", event.getItems());
+        if (event == null || !"Talk-to".equalsIgnoreCase(cleanText(Text.removeTags(event.getMenuOption()))))
+        {
+            return;
+        }
+
+        final String npcName = cleanText(Text.removeTags(event.getMenuTarget()));
+        if (!npcName.isEmpty())
+        {
+            captureInventorySnapshot();
+            pendingNpcInventoryRewardInteraction = new NpcInventoryRewardInteraction(
+                npcName,
+                System.currentTimeMillis() + NPC_INVENTORY_REWARD_WINDOW_MILLIS
+            );
+        }
     }
 
     @Subscribe
     public void onItemContainerChanged(ItemContainerChanged event)
     {
         final int containerId = event.getContainerId();
+        if (containerId == net.runelite.api.InventoryID.INVENTORY.getId())
+        {
+            handleNpcInventoryReward(event.getItemContainer());
+            return;
+        }
         if (!BINGO_REWARD_CONTAINER_IDS.contains(containerId))
         {
             return;
@@ -1122,6 +1153,65 @@ public class ParentsGuildPlugin extends Plugin
         {
             handleLoot(rewardContainerSourceName(containerId), gainedItems);
         }
+    }
+
+    private void handleNpcInventoryReward(ItemContainer itemContainer)
+    {
+        final Map<Integer, Integer> currentItems = aggregateContainerItems(itemContainer);
+        if (!inventorySnapshotInitialized)
+        {
+            inventorySnapshot.putAll(currentItems);
+            inventorySnapshotInitialized = true;
+            return;
+        }
+
+        final NpcInventoryRewardInteraction interaction = pendingNpcInventoryRewardInteraction;
+        final boolean npcRewardWindowActive = interaction != null && interaction.getExpiresAtMillis() >= System.currentTimeMillis();
+        if (interaction != null && !npcRewardWindowActive)
+        {
+            pendingNpcInventoryRewardInteraction = null;
+        }
+
+        final List<ItemStack> gainedItems = new ArrayList<>();
+        for (Map.Entry<Integer, Integer> entry : currentItems.entrySet())
+        {
+            final int gainedQuantity = entry.getValue() - inventorySnapshot.getOrDefault(entry.getKey(), 0);
+            if (gainedQuantity > 0 && (npcRewardWindowActive || isUntradeableItem(entry.getKey())))
+            {
+                gainedItems.add(new ItemStack(entry.getKey(), gainedQuantity));
+            }
+        }
+        if (!gainedItems.isEmpty())
+        {
+            handleLoot(
+                npcRewardWindowActive ? "NPC reward: " + interaction.getNpcName() : "Untradeable inventory gain",
+                gainedItems
+            );
+        }
+
+        inventorySnapshot.clear();
+        inventorySnapshot.putAll(currentItems);
+    }
+
+    private boolean isUntradeableItem(int itemId)
+    {
+        try
+        {
+            final ItemComposition item = itemManager.getItemComposition(canonicalItemId(itemId));
+            return item != null && !item.isTradeable();
+        }
+        catch (RuntimeException ex)
+        {
+            debugLog("Could not determine whether item {} is tradable: {}", itemId, ex.getMessage());
+            return false;
+        }
+    }
+
+    private void captureInventorySnapshot()
+    {
+        inventorySnapshot.clear();
+        inventorySnapshot.putAll(aggregateContainerItems(client.getItemContainer(net.runelite.api.InventoryID.INVENTORY.getId())));
+        inventorySnapshotInitialized = true;
     }
 
     private static Map<Integer, Integer> aggregateContainerItems(ItemContainer itemContainer)
@@ -3524,6 +3614,13 @@ public class ParentsGuildPlugin extends Plugin
         int pendingCompletions;
         List<BingoBoardItem> multiItems;
         BufferedImage backgroundImage;
+    }
+
+    @Value
+    static class NpcInventoryRewardInteraction
+    {
+        String npcName;
+        long expiresAtMillis;
     }
 
     @Value
