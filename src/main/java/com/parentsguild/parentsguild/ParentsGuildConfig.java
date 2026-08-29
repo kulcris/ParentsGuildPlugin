@@ -33,8 +33,7 @@ public interface ParentsGuildConfig extends Config
     @ConfigItem(
         keyName = "websiteBaseUrl",
         name = "Website base URL",
-        description = "The ParentsGuild website base URL, such as https://theparentsguild.org.",
-        warning = "This plugin submits screenshots and account data to a 3rd party website not controlled or verified by the RuneLite Developers.",
+        description = "The clan website URL,
         position = 0
     )
     default String websiteBaseUrl()
@@ -46,7 +45,6 @@ public interface ParentsGuildConfig extends Config
         keyName = "enableBingoDrops",
         name = "Enable bingo drops",
         description = "Capture loot drops and submit them to the ParentsGuild bingo drop endpoint.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
         section = bingoSection,
         position = 0
     )
@@ -59,7 +57,6 @@ public interface ParentsGuildConfig extends Config
         keyName = "showBingoOverlay",
         name = "Show bingo overlay",
         description = "Display the active bingo name, team name, and event time in a RuneLite overlay when this account is on the active board.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
         section = bingoSection,
         position = 1
     )
@@ -72,7 +69,6 @@ public interface ParentsGuildConfig extends Config
         keyName = "enableBingoMetricTracking",
         name = "Enable bingo metric tracking",
         description = "Track local XP, kill count, and clue metric progress for active bingo metric tiles.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
         section = bingoSection,
         position = 2
     )
@@ -97,7 +93,6 @@ public interface ParentsGuildConfig extends Config
         keyName = "enableWomEventTracking",
         name = "Enable WOM event tracking",
         description = "Show active WOM group competitions and leaderboard progress inside RuneLite.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
         section = womSection,
         position = 0
     )
@@ -110,7 +105,6 @@ public interface ParentsGuildConfig extends Config
         keyName = "submitWomRefreshOnLogout",
         name = "Submit WOM refresh on logout",
         description = "Automatically request a WOM player update when you log out or hop worlds.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers",
         section = womSection,
         position = 1
     )
