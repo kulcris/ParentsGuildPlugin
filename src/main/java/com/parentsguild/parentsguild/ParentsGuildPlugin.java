@@ -79,6 +79,7 @@ import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.AsyncBufferedImage;
 import net.runelite.client.util.LinkBrowser;
 import net.runelite.client.util.Text;
 import okhttp3.Call;
@@ -172,6 +173,7 @@ public class ParentsGuildPlugin extends Plugin
     private final AtomicBoolean womRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoStatusRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoBoardRefreshInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean bingoBoardImageRefreshQueued = new AtomicBoolean(false);
     private volatile long lastConfigWarningAtMillis = 0L;
     private volatile long dropTileEligibilityCacheAtMillis = 0L;
     private volatile Set<Integer> dropTileEligibilityCache = new HashSet<>();
@@ -220,6 +222,7 @@ public class ParentsGuildPlugin extends Plugin
         womRefreshInFlight.set(false);
         bingoStatusRefreshInFlight.set(false);
         bingoBoardRefreshInFlight.set(false);
+        bingoBoardImageRefreshQueued.set(false);
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
@@ -261,6 +264,7 @@ public class ParentsGuildPlugin extends Plugin
         womRefreshInFlight.set(false);
         bingoStatusRefreshInFlight.set(false);
         bingoBoardRefreshInFlight.set(false);
+        bingoBoardImageRefreshQueued.set(false);
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardOverlayEnabled = false;
@@ -2429,6 +2433,7 @@ public class ParentsGuildPlugin extends Plugin
                     row.add(new BingoBoardCell(
                         jsonString(tile, "id"),
                         label,
+                        buildBoardTooltip(tile),
                         buildBoardProgressText(tile),
                         jsonBoolean(tile, "isCompleted"),
                         jsonBoolean(tile, "pendingClaim"),
@@ -2482,6 +2487,57 @@ public class ParentsGuildPlugin extends Plugin
             }
         }
         return members;
+    }
+
+    private static String buildBoardTooltip(JsonObject tile)
+    {
+        final List<String> lines = new ArrayList<>();
+        final String description = cleanText(jsonString(tile, "description"));
+        if (!description.isEmpty())
+        {
+            lines.add(escapeTooltipHtml(description));
+        }
+
+        final String tileType = normalizeName(jsonString(tile, "tileType"));
+        if ("multi_item".equals(tileType))
+        {
+            final int requiredCount = Math.max(1, jsonInt(tile, "multiItemRequiredCount"));
+            if ("all".equals(normalizeName(jsonString(tile, "multiItemRequirement"))))
+            {
+                lines.add("<b>Rules:</b> All listed items are required.");
+            }
+            else
+            {
+                lines.add("<b>Rules:</b> Any " + requiredCount + " listed item" + (requiredCount == 1 ? " is" : "s are") + " required.");
+            }
+            if ("unique".equals(normalizeName(jsonString(tile, "multiItemCountMode"))))
+            {
+                lines.add("Each counted submission must be a different item.");
+            }
+            if (jsonBoolean(tile, "multiItemRequireDifferentMembers"))
+            {
+                lines.add("Each counted item must come from a different team member.");
+            }
+        }
+        else if (("manual".equals(tileType) || "drop".equals(tileType))
+            && "one_per_account".equals(normalizeName(jsonString(tile, "repeatContributionMode"))))
+        {
+            lines.add("<b>Rules:</b> Each counted claim must be from a different team account.");
+        }
+
+        if ("participant".equals(normalizeName(jsonString(tile, "metricScope"))))
+        {
+            lines.add("<b>Rules:</b> One team account must meet this metric.");
+        }
+        return lines.isEmpty() ? "" : "<html>" + String.join("<br>", lines) + "</html>";
+    }
+
+    private static String escapeTooltipHtml(String value)
+    {
+        return value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>");
     }
 
     private static String buildBoardProgressText(JsonObject tile)
@@ -2548,7 +2604,7 @@ public class ParentsGuildPlugin extends Plugin
         {
             final String updatedAt = cleanText(jsonString(tile, "backgroundImageUpdatedAt"));
             final String version = updatedAt.isEmpty() ? "" : "&v=" + urlEncode(updatedAt);
-            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId) + version));
+            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId) + "&format=png" + version));
         }
 
         if ("multi_item".equals(normalizeName(jsonString(tile, "tileType"))))
@@ -2573,7 +2629,7 @@ public class ParentsGuildPlugin extends Plugin
         final String metricKey = cleanText(jsonString(tile, "metricKey"));
         if ("metric".equals(normalizeName(jsonString(tile, "tileType"))) && metricKey.startsWith("boss:"))
         {
-            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-icon.php?metricKey=" + urlEncode(metricKey)));
+            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-icon.php?metricKey=" + urlEncode(metricKey) + "&format=png"));
         }
 
         return null;
@@ -2588,17 +2644,23 @@ public class ParentsGuildPlugin extends Plugin
             {
                 continue;
             }
-            final int itemId = jsonInt(itemElement.getAsJsonObject(), "itemId");
+            final JsonObject item = itemElement.getAsJsonObject();
+            if (item.has("displayOnTile") && !jsonBoolean(item, "displayOnTile"))
+            {
+                continue;
+            }
+            final int itemId = jsonInt(item, "itemId");
             if (itemId <= 0)
             {
                 continue;
             }
             try
             {
-                final BufferedImage image = itemManager.getImage(itemId);
+                final AsyncBufferedImage image = itemManager.getImage(itemId);
                 if (image != null)
                 {
                     images.add(image);
+                    image.onLoaded(this::requestBingoBoardImageRefresh);
                 }
             }
             catch (RuntimeException ex)
@@ -2651,6 +2713,18 @@ public class ParentsGuildPlugin extends Plugin
             graphics.dispose();
         }
         return combined;
+    }
+
+    private void requestBingoBoardImageRefresh()
+    {
+        if (womExecutor == null || !bingoBoardImageRefreshQueued.compareAndSet(false, true))
+        {
+            return;
+        }
+        womExecutor.schedule(() -> {
+            bingoBoardImageRefreshQueued.set(false);
+            requestBingoBoardRefresh(false);
+        }, 1, TimeUnit.SECONDS);
     }
 
     private static void drawScaledImage(Graphics2D graphics, BufferedImage image, int x, int y, int width, int height)
@@ -3435,6 +3509,7 @@ public class ParentsGuildPlugin extends Plugin
     {
         String tileId;
         String label;
+        String tooltipText;
         String progressText;
         boolean completed;
         boolean pending;

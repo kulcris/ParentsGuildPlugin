@@ -103,6 +103,7 @@ class ParentsGuildBoardPopup extends JFrame
     {
         private final ParentsGuildPlugin plugin;
         private final List<ProofButtonTarget> proofButtonTargets = new ArrayList<>();
+        private final List<TileTarget> tileTargets = new ArrayList<>();
         private ParentsGuildPlugin.BingoBoardState state = ParentsGuildPlugin.BingoBoardState.hidden();
 
         BoardPanel(ParentsGuildPlugin plugin)
@@ -151,9 +152,13 @@ class ParentsGuildBoardPopup extends JFrame
         @Override
         public String getToolTipText(MouseEvent event)
         {
-            return cellForProofButton(event.getX(), event.getY()) == null
-                ? null
-                : "Submit manual screenshot proof";
+            if (cellForProofButton(event.getX(), event.getY()) != null)
+            {
+                return "Submit manual screenshot proof";
+            }
+
+            final ParentsGuildPlugin.BingoBoardCell cell = cellForTile(event.getX(), event.getY());
+            return cell == null ? null : cell.getTooltipText();
         }
 
         @Override
@@ -197,6 +202,7 @@ class ParentsGuildBoardPopup extends JFrame
             graphics.setColor(PANEL_BORDER);
             graphics.drawRect(x, y, Math.max(1, width), Math.max(1, height));
             proofButtonTargets.clear();
+            tileTargets.clear();
 
             if (state == null || !state.isVisible())
             {
@@ -250,6 +256,7 @@ class ParentsGuildBoardPopup extends JFrame
                     final ParentsGuildPlugin.BingoBoardCell cell = row.get(colIndex);
                     final int cellX = x + PANEL_PADDING + (colIndex * (cellSize + GRID_GAP));
                     final int cellY = y + HEADER_HEIGHT + (rowIndex * (cellSize + GRID_GAP));
+                    tileTargets.add(new TileTarget(new Rectangle(cellX, cellY, cellSize, cellSize), cell));
                     final Rectangle proofButton = drawCell(graphics, cell, cellX, cellY, cellSize, cellSize, cellFont, progressFont);
                     if (proofButton != null)
                     {
@@ -264,6 +271,18 @@ class ParentsGuildBoardPopup extends JFrame
         private ParentsGuildPlugin.BingoBoardCell cellForProofButton(int x, int y)
         {
             for (ProofButtonTarget target : proofButtonTargets)
+            {
+                if (target.bounds.contains(x, y))
+                {
+                    return target.cell;
+                }
+            }
+            return null;
+        }
+
+        private ParentsGuildPlugin.BingoBoardCell cellForTile(int x, int y)
+        {
+            for (TileTarget target : tileTargets)
             {
                 if (target.bounds.contains(x, y))
                 {
@@ -508,6 +527,18 @@ class ParentsGuildBoardPopup extends JFrame
             private final ParentsGuildPlugin.BingoBoardCell cell;
 
             ProofButtonTarget(Rectangle bounds, ParentsGuildPlugin.BingoBoardCell cell)
+            {
+                this.bounds = bounds;
+                this.cell = cell;
+            }
+        }
+
+        private static class TileTarget
+        {
+            private final Rectangle bounds;
+            private final ParentsGuildPlugin.BingoBoardCell cell;
+
+            TileTarget(Rectangle bounds, ParentsGuildPlugin.BingoBoardCell cell)
             {
                 this.bounds = bounds;
                 this.cell = cell;
