@@ -598,7 +598,13 @@ public class ParentsGuildPlugin extends Plugin
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked event)
     {
-        if (event == null || !"Talk-to".equalsIgnoreCase(cleanText(Text.removeTags(event.getMenuOption()))))
+        if (event == null)
+        {
+            return;
+        }
+
+        final String menuOption = cleanText(Text.removeTags(event.getMenuOption()));
+        if (!"Talk-to".equalsIgnoreCase(menuOption))
         {
             return;
         }
@@ -1184,7 +1190,7 @@ public class ParentsGuildPlugin extends Plugin
         if (!gainedItems.isEmpty())
         {
             handleLoot(
-                npcRewardWindowActive ? "NPC reward: " + interaction.getNpcName() : "Untradeable inventory gain",
+                npcRewardWindowActive ? "NPC reward: " + interaction.getNpcName() : "Untradable inventory reward",
                 gainedItems
             );
         }
@@ -2604,7 +2610,12 @@ public class ParentsGuildPlugin extends Plugin
             {
                 lines.add("Each counted submission must be a different item.");
             }
-            if (jsonBoolean(tile, "multiItemRequireDifferentMembers"))
+            final String memberRule = normalizeName(jsonString(tile, "multiItemMemberRule"));
+            if ("same".equals(memberRule))
+            {
+                lines.add("Every counted item must come from the same team member.");
+            }
+            else if ("different".equals(memberRule) || jsonBoolean(tile, "multiItemRequireDifferentMembers"))
             {
                 lines.add("Each counted item must come from a different team member.");
             }
