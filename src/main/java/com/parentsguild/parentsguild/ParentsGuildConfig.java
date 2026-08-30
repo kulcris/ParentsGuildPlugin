@@ -24,9 +24,16 @@ public interface ParentsGuildConfig extends Config
     String womSection = "wom";
 
     @ConfigSection(
+        name = "Lifetime Loot",
+        description = "Optional clan-wide loot record submissions.",
+        position = 3
+    )
+    String lifetimeLootSection = "lifetimeLoot";
+
+    @ConfigSection(
         name = "Display",
         description = "Date and time display preferences.",
-        position = 3
+        position = 4
     )
     String displaySection = "display";
 
@@ -73,6 +80,18 @@ public interface ParentsGuildConfig extends Config
         position = 2
     )
     default boolean enableBingoMetricTracking()
+    {
+        return false;
+    }
+
+    @ConfigItem(
+        keyName = "enableLifetimeLoot",
+        name = "Send Lifetime Loot",
+        description = "Opt in to send supported non-PvP loot stacks and their current RuneLite value to the clan Lifetime Loot record.",
+        section = lifetimeLootSection,
+        position = 0
+    )
+    default boolean enableLifetimeLoot()
     {
         return false;
     }

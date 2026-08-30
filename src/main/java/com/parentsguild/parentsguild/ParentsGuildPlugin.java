@@ -84,6 +84,7 @@ import net.runelite.client.util.LinkBrowser;
 import net.runelite.client.util.Text;
 import okhttp3.Call;
 import okhttp3.Callback;
+import okhttp3.FormBody;
 import okhttp3.MediaType;
 import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
@@ -126,6 +127,12 @@ public class ParentsGuildPlugin extends Plugin
         InventoryID.COLOSSEUM_REWARDS, "Reward chest: Fortis colosseum reward chest"
     );
     private static final Set<Integer> BINGO_REWARD_CONTAINER_IDS = new HashSet<>(BINGO_REWARD_CONTAINER_NAMES.keySet());
+    private static final Set<String> INVENTORY_LOOT_CHEST_NAMES = Set.of(
+        "brimstone chest",
+        "crystal chest",
+        "larran's big chest",
+        "larran's small chest"
+    );
 
     @Inject
     private ParentsGuildConfig config;
@@ -604,13 +611,11 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String menuOption = cleanText(Text.removeTags(event.getMenuOption()));
-        if (!"Talk-to".equalsIgnoreCase(menuOption))
-        {
-            return;
-        }
-
         final String npcName = cleanText(Text.removeTags(event.getMenuTarget()));
-        if (!npcName.isEmpty())
+        final boolean npcRewardInteraction = "Talk-to".equalsIgnoreCase(menuOption) && !npcName.isEmpty();
+        final boolean lootChestInteraction = "Open".equalsIgnoreCase(menuOption)
+            && INVENTORY_LOOT_CHEST_NAMES.contains(normalizeName(npcName));
+        if (npcRewardInteraction || lootChestInteraction)
         {
             captureInventorySnapshot();
             pendingNpcInventoryRewardInteraction = new NpcInventoryRewardInteraction(
@@ -1259,7 +1264,9 @@ public class ParentsGuildPlugin extends Plugin
 
     private void handleLoot(String sourceName, Collection<ItemStack> items)
     {
-        if (!config.enableBingoDrops())
+        final boolean bingoDropsEnabled = config.enableBingoDrops();
+        final boolean lifetimeLootEnabled = config.enableLifetimeLoot();
+        if (!bingoDropsEnabled && !lifetimeLootEnabled)
         {
             return;
         }
@@ -1269,14 +1276,16 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        final String endpoint = resolveBingoDropEndpoint();
+        final String bingoEndpoint = bingoDropsEnabled ? resolveBingoDropEndpoint() : "";
+        final String lifetimeEndpoint = lifetimeLootEnabled ? resolveLifetimeLootEndpoint() : "";
         final Player localPlayer = client.getLocalPlayer();
         if (localPlayer == null || items == null || items.isEmpty())
         {
             debugLog("Skipping loot submission because player/items were incomplete.");
             return;
         }
-        if (!isConfiguredForSubmission(endpoint))
+        if ((bingoDropsEnabled && !isConfiguredForSubmission(bingoEndpoint))
+            || (lifetimeLootEnabled && !isConfiguredForSubmission(lifetimeEndpoint)))
         {
             warnConfigIncomplete("ParentsGuild: set the website URL in plugin config.");
             return;
@@ -1320,7 +1329,8 @@ public class ParentsGuildPlugin extends Plugin
                 continue;
             }
 
-            drops.add(new PendingDrop(eventId, canonicalItemId, item.getQuantity(), itemName, capturedAtUtc));
+            final long unitValue = Math.max(0L, itemManager.getItemPrice(canonicalItemId));
+            drops.add(new PendingDrop(eventId, canonicalItemId, item.getQuantity(), itemName, unitValue, capturedAtUtc));
         }
 
         if (drops.isEmpty())
@@ -1331,11 +1341,20 @@ public class ParentsGuildPlugin extends Plugin
 
         if (womExecutor == null)
         {
-            debugLog("Skipping bingo drop screenshots because the plugin executor is unavailable.");
+            debugLog("Skipping loot submissions because the plugin executor is unavailable.");
             return;
         }
 
-        womExecutor.execute(() -> submitEligibleDropScreenshots(endpoint, playerRsn, cleanedSourceName, drops));
+        womExecutor.execute(() -> {
+            if (lifetimeLootEnabled)
+            {
+                submitLifetimeLoot(lifetimeEndpoint, playerRsn, cleanedSourceName, drops);
+            }
+            if (bingoDropsEnabled)
+            {
+                submitEligibleDropScreenshots(bingoEndpoint, playerRsn, cleanedSourceName, drops);
+            }
+        });
     }
 
     private void submitEligibleDropScreenshots(String dropEndpoint, String playerRsn, String sourceName, List<PendingDrop> drops)
@@ -1670,6 +1689,48 @@ public class ParentsGuildPlugin extends Plugin
         });
     }
 
+    private void submitLifetimeLoot(String endpoint, String playerRsn, String sourceName, List<PendingDrop> drops)
+    {
+        for (PendingDrop drop : drops)
+        {
+            final FormBody body = new FormBody.Builder()
+                .add("source", "runelite_plugin")
+                .add("eventId", drop.getEventId())
+                .add("playerRsn", playerRsn)
+                .add("itemId", Integer.toString(drop.getItemId()))
+                .add("itemName", drop.getItemName())
+                .add("quantity", Integer.toString(drop.getQuantity()))
+                .add("unitValue", Long.toString(drop.getUnitValue()))
+                .add("sourceName", sourceName)
+                .add("capturedAtUtc", drop.getCapturedAtUtc())
+                .build();
+            final Request request = new Request.Builder().url(endpoint).header("Accept", "application/json").post(body).build();
+            okHttpClient.newCall(request).enqueue(new Callback()
+            {
+                @Override
+                public void onFailure(Call call, IOException e)
+                {
+                    log.warn("Lifetime Loot submission failed", e);
+                }
+
+                @Override
+                public void onResponse(Call call, Response response) throws IOException
+                {
+                    try (Response httpResponse = response)
+                    {
+                        final String responseBody = httpResponse.body() != null ? httpResponse.body().string() : "";
+                        if (!httpResponse.isSuccessful())
+                        {
+                            log.warn("Lifetime Loot endpoint returned HTTP {}: {}", httpResponse.code(), responseBody);
+                            return;
+                        }
+                        debugLog("Lifetime Loot outcome={} item={}", jsonString(parseResponseJson(responseBody), "outcome"), drop.getItemName());
+                    }
+                }
+            });
+        }
+    }
+
     // Manual proof capture
 
     void submitBingoTileProof(BingoBoardCell cell)
@@ -1975,6 +2036,12 @@ public class ParentsGuildPlugin extends Plugin
     {
         final String base = resolveEndpointBase(config.websiteBaseUrl());
         return base.isEmpty() ? "" : base + "/api/integrations/bingo-drop.php";
+    }
+
+    private String resolveLifetimeLootEndpoint()
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() ? "" : base + "/api/integrations/lifetime-loot.php";
     }
 
     private String resolveBingoProofEndpoint()
@@ -3415,6 +3482,7 @@ public class ParentsGuildPlugin extends Plugin
         int itemId;
         int quantity;
         String itemName;
+        long unitValue;
         String capturedAtUtc;
     }
 
