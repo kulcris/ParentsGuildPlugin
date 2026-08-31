@@ -61,6 +61,7 @@ import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.StatChanged;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.client.Notifier;
@@ -1331,7 +1332,7 @@ public class ParentsGuildPlugin extends Plugin
             }
 
             final long unitValue = Math.max(0L, itemManager.getItemPrice(canonicalItemId));
-            drops.add(new PendingDrop(eventId, canonicalItemId, item.getQuantity(), itemName, unitValue, capturedAtUtc));
+            drops.add(new PendingDrop(eventId, canonicalItemId, item.getQuantity(), itemName, unitValue, capturedAtUtc, captureDropLocation(localPlayer)));
         }
 
         if (drops.isEmpty())
@@ -1356,6 +1357,16 @@ public class ParentsGuildPlugin extends Plugin
                 submitEligibleDropScreenshots(bingoEndpoint, playerRsn, cleanedSourceName, drops);
             }
         });
+    }
+
+    private DropLocation captureDropLocation(Player localPlayer)
+    {
+        final WorldPoint location = localPlayer.getWorldLocation();
+        if (location == null)
+        {
+            return new DropLocation(client.getWorld(), 0, 0, 0);
+        }
+        return new DropLocation(client.getWorld(), location.getX(), location.getY(), location.getPlane());
     }
 
     private void submitEligibleDropScreenshots(String dropEndpoint, String playerRsn, String sourceName, List<PendingDrop> drops)
@@ -1633,6 +1644,10 @@ public class ParentsGuildPlugin extends Plugin
             .addFormDataPart("quantity", Integer.toString(drop.getQuantity()))
             .addFormDataPart("sourceName", sourceName)
             .addFormDataPart("capturedAtUtc", drop.getCapturedAtUtc())
+            .addFormDataPart("worldId", Integer.toString(drop.getLocation().getWorldId()))
+            .addFormDataPart("worldX", Integer.toString(drop.getLocation().getX()))
+            .addFormDataPart("worldY", Integer.toString(drop.getLocation().getY()))
+            .addFormDataPart("plane", Integer.toString(drop.getLocation().getPlane()))
             .addFormDataPart("proof", "parentsguild-bingo-drop.png", RequestBody.create(PNG, screenshotBytes))
             .build();
 
@@ -1703,6 +1718,10 @@ public class ParentsGuildPlugin extends Plugin
                 .add("quantity", Integer.toString(drop.getQuantity()))
                 .add("unitValue", Long.toString(drop.getUnitValue()))
                 .add("sourceName", sourceName)
+                .add("worldId", Integer.toString(drop.getLocation().getWorldId()))
+                .add("worldX", Integer.toString(drop.getLocation().getX()))
+                .add("worldY", Integer.toString(drop.getLocation().getY()))
+                .add("plane", Integer.toString(drop.getLocation().getPlane()))
                 .add("capturedAtUtc", drop.getCapturedAtUtc())
                 .add("seasonalWorld", Boolean.toString(client.getWorldType().contains(WorldType.SEASONAL)))
                 .build();
@@ -3486,6 +3505,16 @@ public class ParentsGuildPlugin extends Plugin
         String itemName;
         long unitValue;
         String capturedAtUtc;
+        DropLocation location;
+    }
+
+    @Value
+    private static class DropLocation
+    {
+        int worldId;
+        int x;
+        int y;
+        int plane;
     }
 
     @Value

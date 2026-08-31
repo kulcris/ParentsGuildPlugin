@@ -57,7 +57,7 @@ public interface ParentsGuildConfig extends Config
     )
     default boolean enableBingoDrops()
     {
-        return false;
+        return true;
     }
 
     @ConfigItem(
@@ -69,7 +69,7 @@ public interface ParentsGuildConfig extends Config
     )
     default boolean showBingoOverlay()
     {
-        return false;
+        return true;
     }
 
     @ConfigItem(
@@ -81,7 +81,7 @@ public interface ParentsGuildConfig extends Config
     )
     default boolean enableBingoMetricTracking()
     {
-        return false;
+        return true;
     }
 
     @ConfigItem(
@@ -93,7 +93,7 @@ public interface ParentsGuildConfig extends Config
     )
     default boolean enableLifetimeLoot()
     {
-        return false;
+        return true;
     }
 
     @ConfigItem(
