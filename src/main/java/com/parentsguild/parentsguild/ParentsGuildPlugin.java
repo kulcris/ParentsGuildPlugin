@@ -56,6 +56,7 @@ import net.runelite.api.ItemContainer;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.Player;
 import net.runelite.api.Skill;
+import net.runelite.api.WorldType;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOptionClicked;
@@ -1703,6 +1704,7 @@ public class ParentsGuildPlugin extends Plugin
                 .add("unitValue", Long.toString(drop.getUnitValue()))
                 .add("sourceName", sourceName)
                 .add("capturedAtUtc", drop.getCapturedAtUtc())
+                .add("seasonalWorld", Boolean.toString(client.getWorldType().contains(WorldType.SEASONAL)))
                 .build();
             final Request request = new Request.Builder().url(endpoint).header("Accept", "application/json").post(body).build();
             okHttpClient.newCall(request).enqueue(new Callback()
