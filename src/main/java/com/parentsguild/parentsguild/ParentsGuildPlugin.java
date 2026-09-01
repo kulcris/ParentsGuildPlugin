@@ -141,6 +141,14 @@ public class ParentsGuildPlugin extends Plugin
         InterfaceID.GRAVESTONE_GENERIC,
         InterfaceID.DEATH_OFFICE
     );
+    private static final Set<Integer> STORAGE_INTERFACE_IDS = Set.of(
+        InterfaceID.CLANS_STORAGE_MAIN,
+        InterfaceID.CLANS_STORAGE_SIDE,
+        InterfaceID.RAIDS_STORAGE_PRIVATE,
+        InterfaceID.RAIDS_STORAGE_SHARED,
+        InterfaceID.RAIDS_STORAGE_SIDE,
+        InterfaceID.SEED_VAULT
+    );
     private static final Set<String> RECOVERY_TARGET_NAMES = Set.of("death", "grave", "gravestone");
     private static final Set<Integer> BINGO_REWARD_CONTAINER_IDS = new HashSet<>(BINGO_REWARD_CONTAINER_NAMES.keySet());
     private static final Set<String> INVENTORY_LOOT_CHEST_NAMES = Set.of(
@@ -206,9 +214,10 @@ public class ParentsGuildPlugin extends Plugin
     private volatile Instant pluginStartedAt = Instant.EPOCH;
     private volatile String lastLoggedInRsn = "";
     private volatile NpcInventoryRewardInteraction pendingNpcInventoryRewardInteraction;
-    private volatile BankWithdrawalInteraction pendingBankWithdrawalInteraction;
+    private volatile StorageWithdrawalInteraction pendingStorageWithdrawalInteraction;
     private volatile RecoveryInteraction pendingRecoveryInteraction;
     private volatile boolean recoveryInterfaceOpen;
+    private volatile boolean storageInterfaceOpen;
     private volatile long lastLocationHeartbeatAtMillis;
     private volatile int locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
     private volatile boolean inventorySnapshotInitialized;
@@ -246,9 +255,10 @@ public class ParentsGuildPlugin extends Plugin
         rewardContainerSnapshots.clear();
         inventorySnapshot.clear();
         pendingNpcInventoryRewardInteraction = null;
-        pendingBankWithdrawalInteraction = null;
+        pendingStorageWithdrawalInteraction = null;
         pendingRecoveryInteraction = null;
         recoveryInterfaceOpen = false;
+        storageInterfaceOpen = false;
         inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
@@ -305,9 +315,10 @@ public class ParentsGuildPlugin extends Plugin
         rewardContainerSnapshots.clear();
         inventorySnapshot.clear();
         pendingNpcInventoryRewardInteraction = null;
-        pendingBankWithdrawalInteraction = null;
+        pendingStorageWithdrawalInteraction = null;
         pendingRecoveryInteraction = null;
         recoveryInterfaceOpen = false;
+        storageInterfaceOpen = false;
         inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
@@ -413,9 +424,10 @@ public class ParentsGuildPlugin extends Plugin
         {
             inventorySnapshot.clear();
             pendingNpcInventoryRewardInteraction = null;
-            pendingBankWithdrawalInteraction = null;
+            pendingStorageWithdrawalInteraction = null;
             pendingRecoveryInteraction = null;
             recoveryInterfaceOpen = false;
+            storageInterfaceOpen = false;
             inventorySnapshotInitialized = false;
             final String playerRsn = cleanText(lastLoggedInRsn);
             if (!playerRsn.isEmpty() && config.submitWomRefreshOnLogout())
@@ -680,7 +692,7 @@ public class ParentsGuildPlugin extends Plugin
         final String menuTarget = cleanText(Text.removeTags(event.getMenuTarget()));
         if (menuOption.toLowerCase(Locale.ROOT).startsWith("withdraw") && !menuTarget.isEmpty())
         {
-            pendingBankWithdrawalInteraction = new BankWithdrawalInteraction(
+            pendingStorageWithdrawalInteraction = new StorageWithdrawalInteraction(
                 normalizeName(menuTarget),
                 System.currentTimeMillis() + BANK_WITHDRAWAL_WINDOW_MILLIS
             );
@@ -715,14 +727,19 @@ public class ParentsGuildPlugin extends Plugin
     @Subscribe
     public void onWidgetLoaded(WidgetLoaded event)
     {
-        if (!RECOVERY_INTERFACE_IDS.contains(event.getGroupId()))
+        final int groupId = event.getGroupId();
+        if (RECOVERY_INTERFACE_IDS.contains(groupId))
         {
-            return;
+            recoveryInterfaceOpen = true;
+            pendingRecoveryInteraction = null;
+            captureInventorySnapshot();
         }
 
-        recoveryInterfaceOpen = true;
-        pendingRecoveryInteraction = null;
-        captureInventorySnapshot();
+        if (STORAGE_INTERFACE_IDS.contains(groupId))
+        {
+            storageInterfaceOpen = true;
+            captureInventorySnapshot();
+        }
     }
 
     @Subscribe
@@ -731,6 +748,10 @@ public class ParentsGuildPlugin extends Plugin
         if (RECOVERY_INTERFACE_IDS.contains(event.getGroupId()))
         {
             recoveryInterfaceOpen = false;
+        }
+        if (STORAGE_INTERFACE_IDS.contains(event.getGroupId()))
+        {
+            storageInterfaceOpen = false;
         }
     }
 
@@ -1425,10 +1446,10 @@ public class ParentsGuildPlugin extends Plugin
         {
             pendingNpcInventoryRewardInteraction = null;
         }
-        final BankWithdrawalInteraction bankWithdrawal = pendingBankWithdrawalInteraction;
-        if (bankWithdrawal != null && bankWithdrawal.getExpiresAtMillis() < System.currentTimeMillis())
+        final StorageWithdrawalInteraction storageWithdrawal = pendingStorageWithdrawalInteraction;
+        if (storageWithdrawal != null && storageWithdrawal.getExpiresAtMillis() < System.currentTimeMillis())
         {
-            pendingBankWithdrawalInteraction = null;
+            pendingStorageWithdrawalInteraction = null;
         }
 
         final boolean recoveryActive = isRecoveryActive();
@@ -1441,11 +1462,19 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
+        if (storageInterfaceOpen)
+        {
+            debugLog("Skipping inventory gains from storage withdrawal");
+            inventorySnapshot.clear();
+            inventorySnapshot.putAll(currentItems);
+            return;
+        }
+
         final List<ItemStack> gainedItems = new ArrayList<>();
         for (Map.Entry<Integer, Integer> entry : currentItems.entrySet())
         {
             final int gainedQuantity = entry.getValue() - inventorySnapshot.getOrDefault(entry.getKey(), 0);
-            if (gainedQuantity > 0 && (npcRewardWindowActive || (isUntradeableItem(entry.getKey()) && !isPendingBankWithdrawal(entry.getKey()))))
+            if (gainedQuantity > 0 && (npcRewardWindowActive || (isUntradeableItem(entry.getKey()) && !isPendingStorageWithdrawal(entry.getKey()))))
             {
                 gainedItems.add(new ItemStack(entry.getKey(), gainedQuantity));
             }
@@ -1476,12 +1505,12 @@ public class ParentsGuildPlugin extends Plugin
         }
     }
 
-    private boolean isPendingBankWithdrawal(int itemId)
+    private boolean isPendingStorageWithdrawal(int itemId)
     {
-        final BankWithdrawalInteraction withdrawal = pendingBankWithdrawalInteraction;
+        final StorageWithdrawalInteraction withdrawal = pendingStorageWithdrawalInteraction;
         if (withdrawal == null || withdrawal.getExpiresAtMillis() < System.currentTimeMillis())
         {
-            pendingBankWithdrawalInteraction = null;
+            pendingStorageWithdrawalInteraction = null;
             return false;
         }
 
@@ -1493,13 +1522,13 @@ public class ParentsGuildPlugin extends Plugin
             {
                 return false;
             }
-            pendingBankWithdrawalInteraction = null;
-            debugLog("Skipping untradable bank withdrawal for {}", item != null ? item.getName() : itemId);
+            pendingStorageWithdrawalInteraction = null;
+            debugLog("Skipping untradable storage withdrawal for {}", item != null ? item.getName() : itemId);
             return true;
         }
         catch (RuntimeException ex)
         {
-            debugLog("Could not match bank withdrawal for item {}: {}", itemId, ex.getMessage());
+            debugLog("Could not match storage withdrawal for item {}: {}", itemId, ex.getMessage());
             return false;
         }
     }
@@ -4083,7 +4112,7 @@ public class ParentsGuildPlugin extends Plugin
     }
 
     @Value
-    static class BankWithdrawalInteraction
+    static class StorageWithdrawalInteraction
     {
         String itemName;
         long expiresAtMillis;
