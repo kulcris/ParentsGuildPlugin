@@ -61,6 +61,8 @@ import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.StatChanged;
+import net.runelite.api.events.WidgetClosed;
+import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.InterfaceID;
@@ -115,6 +117,11 @@ public class ParentsGuildPlugin extends Plugin
     private static final long COMPLETED_DROP_DENY_CACHE_MILLIS = TimeUnit.MINUTES.toMillis(10);
     private static final long WOM_HTTP_TIMEOUT_WARNING_MILLIS = 20_000L;
     private static final long NPC_INVENTORY_REWARD_WINDOW_MILLIS = TimeUnit.SECONDS.toMillis(12);
+    private static final long BANK_WITHDRAWAL_WINDOW_MILLIS = TimeUnit.SECONDS.toMillis(5);
+    private static final long RECOVERY_INTERACTION_WINDOW_MILLIS = TimeUnit.SECONDS.toMillis(12);
+    private static final long LOCATION_SETTINGS_REFRESH_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    private static final long LOCATION_HEARTBEAT_MIN_GAP_MILLIS = TimeUnit.SECONDS.toMillis(30);
+    private static final int LOCATION_HEARTBEAT_INTERVAL_SECONDS = 180;
     private static final int BINGO_STATUS_REFRESH_SECONDS = 60;
     private static final int[] LOGIN_SYNC_DELAYS_SECONDS = {1, 3, 6};
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
@@ -128,6 +135,12 @@ public class ParentsGuildPlugin extends Plugin
         InventoryID.PMOON_REWARDINV, "Reward chest: Lunar chest",
         InventoryID.COLOSSEUM_REWARDS, "Reward chest: Fortis colosseum reward chest"
     );
+    private static final Set<Integer> RECOVERY_INTERFACE_IDS = Set.of(
+        InterfaceID.GRAVESTONE_RETRIEVAL,
+        InterfaceID.GRAVESTONE_GENERIC,
+        InterfaceID.DEATH_OFFICE
+    );
+    private static final Set<String> RECOVERY_TARGET_NAMES = Set.of("death", "grave", "gravestone");
     private static final Set<Integer> BINGO_REWARD_CONTAINER_IDS = new HashSet<>(BINGO_REWARD_CONTAINER_NAMES.keySet());
     private static final Set<String> INVENTORY_LOOT_CHEST_NAMES = Set.of(
         "brimstone chest",
@@ -185,12 +198,18 @@ public class ParentsGuildPlugin extends Plugin
     private final AtomicBoolean bingoStatusRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoBoardRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoBoardImageRefreshQueued = new AtomicBoolean(false);
+    private final AtomicBoolean locationHeartbeatInFlight = new AtomicBoolean(false);
     private volatile long lastConfigWarningAtMillis = 0L;
     private volatile long dropTileEligibilityCacheAtMillis = 0L;
     private volatile Set<Integer> dropTileEligibilityCache = new HashSet<>();
     private volatile Instant pluginStartedAt = Instant.EPOCH;
     private volatile String lastLoggedInRsn = "";
     private volatile NpcInventoryRewardInteraction pendingNpcInventoryRewardInteraction;
+    private volatile BankWithdrawalInteraction pendingBankWithdrawalInteraction;
+    private volatile RecoveryInteraction pendingRecoveryInteraction;
+    private volatile boolean recoveryInterfaceOpen;
+    private volatile long lastLocationHeartbeatAtMillis;
+    private volatile int locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
     private volatile boolean inventorySnapshotInitialized;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
@@ -200,6 +219,8 @@ public class ParentsGuildPlugin extends Plugin
     private ScheduledFuture<?> womRefreshTask;
     private ScheduledFuture<?> bingoStatusTask;
     private ScheduledFuture<?> bingoBoardTask;
+    private ScheduledFuture<?> locationHeartbeatTask;
+    private ScheduledFuture<?> locationSettingsTask;
     private ParentsGuildPanel womPanel;
     private NavigationButton womNavigationButton;
     private ParentsGuildBingoOverlay bingoOverlay;
@@ -224,6 +245,9 @@ public class ParentsGuildPlugin extends Plugin
         rewardContainerSnapshots.clear();
         inventorySnapshot.clear();
         pendingNpcInventoryRewardInteraction = null;
+        pendingBankWithdrawalInteraction = null;
+        pendingRecoveryInteraction = null;
+        recoveryInterfaceOpen = false;
         inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
@@ -239,6 +263,9 @@ public class ParentsGuildPlugin extends Plugin
         bingoStatusRefreshInFlight.set(false);
         bingoBoardRefreshInFlight.set(false);
         bingoBoardImageRefreshQueued.set(false);
+        locationHeartbeatInFlight.set(false);
+        lastLocationHeartbeatAtMillis = 0L;
+        locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
@@ -257,10 +284,14 @@ public class ParentsGuildPlugin extends Plugin
         rescheduleWomRefresh();
         rescheduleBingoStatusRefresh();
         rescheduleBingoBoardRefresh();
+        rescheduleLocationHeartbeat();
+        rescheduleLocationSettingsRefresh();
+        requestPluginLocationSettings();
         requestWomRefresh(true);
         if (client.getGameState() == GameState.LOGGED_IN)
         {
             requestLoginInitialSync();
+            womExecutor.schedule(this::requestLocationHeartbeat, 3, TimeUnit.SECONDS);
         }
     }
 
@@ -273,6 +304,9 @@ public class ParentsGuildPlugin extends Plugin
         rewardContainerSnapshots.clear();
         inventorySnapshot.clear();
         pendingNpcInventoryRewardInteraction = null;
+        pendingBankWithdrawalInteraction = null;
+        pendingRecoveryInteraction = null;
+        recoveryInterfaceOpen = false;
         inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
@@ -284,6 +318,9 @@ public class ParentsGuildPlugin extends Plugin
         bingoStatusRefreshInFlight.set(false);
         bingoBoardRefreshInFlight.set(false);
         bingoBoardImageRefreshQueued.set(false);
+        locationHeartbeatInFlight.set(false);
+        lastLocationHeartbeatAtMillis = 0L;
+        locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardOverlayEnabled = false;
@@ -301,6 +338,16 @@ public class ParentsGuildPlugin extends Plugin
         {
             bingoBoardTask.cancel(true);
             bingoBoardTask = null;
+        }
+        if (locationHeartbeatTask != null)
+        {
+            locationHeartbeatTask.cancel(true);
+            locationHeartbeatTask = null;
+        }
+        if (locationSettingsTask != null)
+        {
+            locationSettingsTask.cancel(true);
+            locationSettingsTask = null;
         }
         if (womExecutor != null)
         {
@@ -338,6 +385,10 @@ public class ParentsGuildPlugin extends Plugin
         rescheduleWomRefresh();
         rescheduleBingoStatusRefresh();
         rescheduleBingoBoardRefresh();
+        rescheduleLocationHeartbeat();
+        rescheduleLocationSettingsRefresh();
+        requestPluginLocationSettings();
+        requestLocationHeartbeat();
         requestWomRefresh(true);
         requestBingoStatusRefresh(true);
         requestBingoBoardRefresh(true);
@@ -350,6 +401,10 @@ public class ParentsGuildPlugin extends Plugin
         {
             requestLoginInitialSync();
             lastLoggedInRsn = currentLocalPlayerName();
+            if (womExecutor != null)
+            {
+                womExecutor.schedule(this::requestLocationHeartbeat, 3, TimeUnit.SECONDS);
+            }
             return;
         }
 
@@ -357,6 +412,9 @@ public class ParentsGuildPlugin extends Plugin
         {
             inventorySnapshot.clear();
             pendingNpcInventoryRewardInteraction = null;
+            pendingBankWithdrawalInteraction = null;
+            pendingRecoveryInteraction = null;
+            recoveryInterfaceOpen = false;
             inventorySnapshotInitialized = false;
             final String playerRsn = cleanText(lastLoggedInRsn);
             if (!playerRsn.isEmpty() && config.submitWomRefreshOnLogout())
@@ -601,7 +659,12 @@ public class ParentsGuildPlugin extends Plugin
     @Subscribe
     public void onNpcLootReceived(NpcLootReceived event)
     {
-        handleLoot(event.getNpc() != null ? event.getNpc().getName() : "", event.getItems());
+        final String npcName = cleanText(event.getNpc() != null ? event.getNpc().getName() : "");
+        if ("death".equals(normalizeName(npcName)))
+        {
+            return;
+        }
+        handleLoot(npcName, event.getItems());
     }
 
     @Subscribe
@@ -613,17 +676,60 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String menuOption = cleanText(Text.removeTags(event.getMenuOption()));
-        final String npcName = cleanText(Text.removeTags(event.getMenuTarget()));
-        final boolean npcRewardInteraction = "Talk-to".equalsIgnoreCase(menuOption) && !npcName.isEmpty();
+        final String menuTarget = cleanText(Text.removeTags(event.getMenuTarget()));
+        if (menuOption.toLowerCase(Locale.ROOT).startsWith("withdraw") && !menuTarget.isEmpty())
+        {
+            pendingBankWithdrawalInteraction = new BankWithdrawalInteraction(
+                normalizeName(menuTarget),
+                System.currentTimeMillis() + BANK_WITHDRAWAL_WINDOW_MILLIS
+            );
+        }
+
+        final String normalizedMenuOption = normalizeName(menuOption);
+        final String normalizedMenuTarget = normalizeName(menuTarget);
+        final boolean recoveryInteraction = isDirectRecoveryInteraction(normalizedMenuOption, normalizedMenuTarget)
+            || (recoveryInterfaceOpen && isRecoveryCollectionOption(normalizedMenuOption));
+        if (recoveryInteraction)
+        {
+            captureInventorySnapshot();
+            pendingRecoveryInteraction = new RecoveryInteraction(
+                menuTarget,
+                System.currentTimeMillis() + RECOVERY_INTERACTION_WINDOW_MILLIS
+            );
+        }
+
+        final boolean npcRewardInteraction = "Talk-to".equalsIgnoreCase(menuOption) && !menuTarget.isEmpty();
         final boolean lootChestInteraction = "Open".equalsIgnoreCase(menuOption)
-            && INVENTORY_LOOT_CHEST_NAMES.contains(normalizeName(npcName));
-        if (npcRewardInteraction || lootChestInteraction)
+            && INVENTORY_LOOT_CHEST_NAMES.contains(normalizeName(menuTarget));
+        if (!recoveryInteraction && (npcRewardInteraction || lootChestInteraction))
         {
             captureInventorySnapshot();
             pendingNpcInventoryRewardInteraction = new NpcInventoryRewardInteraction(
-                npcName,
+                menuTarget,
                 System.currentTimeMillis() + NPC_INVENTORY_REWARD_WINDOW_MILLIS
             );
+        }
+    }
+
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded event)
+    {
+        if (!RECOVERY_INTERFACE_IDS.contains(event.getGroupId()))
+        {
+            return;
+        }
+
+        recoveryInterfaceOpen = true;
+        pendingRecoveryInteraction = null;
+        captureInventorySnapshot();
+    }
+
+    @Subscribe
+    public void onWidgetClosed(WidgetClosed event)
+    {
+        if (RECOVERY_INTERFACE_IDS.contains(event.getGroupId()))
+        {
+            recoveryInterfaceOpen = false;
         }
     }
 
@@ -791,6 +897,138 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         notifier.notify("ParentsGuild: refresh WOM hiscores, \"" + competition.getTitle() + "\" ends in " + Math.max(1, minutesRemaining) + " minute(s).");
+    }
+
+    // Player-controlled location heartbeat
+
+    private void requestPluginLocationSettings()
+    {
+        final ScheduledExecutorService executor = womExecutor;
+        final String endpoint = resolvePluginLocationSettingsEndpoint();
+        if (executor == null || endpoint.isEmpty() || !config.enableLocationHeartbeat())
+        {
+            return;
+        }
+
+        executor.execute(() -> {
+            try
+            {
+                locationHeartbeatIntervalSeconds = fetchLocationHeartbeatIntervalSeconds(endpoint);
+                rescheduleLocationHeartbeat();
+            }
+            catch (IOException | RuntimeException ex)
+            {
+                debugLog("Could not load plugin location timing: {}", ex.getMessage());
+            }
+        });
+    }
+
+    private void rescheduleLocationSettingsRefresh()
+    {
+        if (locationSettingsTask != null)
+        {
+            locationSettingsTask.cancel(false);
+            locationSettingsTask = null;
+        }
+
+        if (womExecutor == null || !config.enableLocationHeartbeat() || resolveEndpointBase(config.websiteBaseUrl()).isEmpty())
+        {
+            return;
+        }
+
+        locationSettingsTask = womExecutor.scheduleWithFixedDelay(
+            this::requestPluginLocationSettings,
+            LOCATION_SETTINGS_REFRESH_MILLIS,
+            LOCATION_SETTINGS_REFRESH_MILLIS,
+            TimeUnit.MILLISECONDS
+        );
+    }
+
+    private void rescheduleLocationHeartbeat()
+    {
+        if (locationHeartbeatTask != null)
+        {
+            locationHeartbeatTask.cancel(false);
+            locationHeartbeatTask = null;
+        }
+
+        if (womExecutor == null || !config.enableLocationHeartbeat() || resolveEndpointBase(config.websiteBaseUrl()).isEmpty())
+        {
+            return;
+        }
+
+        locationHeartbeatTask = womExecutor.scheduleWithFixedDelay(
+            this::requestLocationHeartbeat,
+            locationHeartbeatIntervalSeconds,
+            locationHeartbeatIntervalSeconds,
+            TimeUnit.SECONDS
+        );
+    }
+
+    private void requestLocationHeartbeat()
+    {
+        final ScheduledExecutorService executor = womExecutor;
+        final String endpoint = resolvePluginLocationHeartbeatEndpoint();
+        if (executor == null || endpoint.isEmpty() || !config.enableLocationHeartbeat()
+            || client.getGameState() != GameState.LOGGED_IN || !locationHeartbeatInFlight.compareAndSet(false, true))
+        {
+            return;
+        }
+
+        clientThread.invoke(() -> {
+            try
+            {
+                final Player localPlayer = client.getLocalPlayer();
+                final String playerRsn = currentLocalPlayerName();
+                final WorldPoint location = localPlayer == null ? null : localPlayer.getWorldLocation();
+                final long now = System.currentTimeMillis();
+                if (location == null || playerRsn.isEmpty() || now - lastLocationHeartbeatAtMillis < LOCATION_HEARTBEAT_MIN_GAP_MILLIS)
+                {
+                    return;
+                }
+
+                lastLocationHeartbeatAtMillis = now;
+                final JsonObject payload = new JsonObject();
+                payload.addProperty("playerRsn", playerRsn);
+                payload.addProperty("worldId", client.getWorld());
+                payload.addProperty("worldX", location.getX());
+                payload.addProperty("worldY", location.getY());
+                payload.addProperty("plane", location.getPlane());
+                executor.execute(() -> submitLocationHeartbeat(endpoint, payload));
+            }
+            finally
+            {
+                locationHeartbeatInFlight.set(false);
+            }
+        });
+    }
+
+    private void submitLocationHeartbeat(String endpoint, JsonObject payload)
+    {
+        final Request request = new Request.Builder()
+            .url(endpoint)
+            .header("Accept", "application/json")
+            .post(RequestBody.create(JSON, gson.toJson(payload)))
+            .build();
+        try (Response response = okHttpClient.newCall(request).execute())
+        {
+            if (!response.isSuccessful())
+            {
+                debugLog("Location heartbeat returned HTTP {}", response.code());
+            }
+        }
+        catch (IOException | RuntimeException ex)
+        {
+            debugLog("Location heartbeat failed: {}", ex.getMessage());
+        }
+    }
+
+    private int fetchLocationHeartbeatIntervalSeconds(String endpoint) throws IOException
+    {
+        final int configuredInterval = jsonInt(getJsonObject(endpoint), "locationHeartbeatSeconds");
+        return configuredInterval > 0
+            ? Math.max(60, Math.min(900, configuredInterval))
+            : LOCATION_HEARTBEAT_INTERVAL_SECONDS;
     }
 
     // Bingo status overlay refresh
@@ -1184,12 +1422,27 @@ public class ParentsGuildPlugin extends Plugin
         {
             pendingNpcInventoryRewardInteraction = null;
         }
+        final BankWithdrawalInteraction bankWithdrawal = pendingBankWithdrawalInteraction;
+        if (bankWithdrawal != null && bankWithdrawal.getExpiresAtMillis() < System.currentTimeMillis())
+        {
+            pendingBankWithdrawalInteraction = null;
+        }
+
+        final boolean recoveryActive = isRecoveryActive();
+        if (recoveryActive)
+        {
+            debugLog("Skipping inventory gains from death recovery: {}", recoverySourceName());
+            pendingRecoveryInteraction = null;
+            inventorySnapshot.clear();
+            inventorySnapshot.putAll(currentItems);
+            return;
+        }
 
         final List<ItemStack> gainedItems = new ArrayList<>();
         for (Map.Entry<Integer, Integer> entry : currentItems.entrySet())
         {
             final int gainedQuantity = entry.getValue() - inventorySnapshot.getOrDefault(entry.getKey(), 0);
-            if (gainedQuantity > 0 && (npcRewardWindowActive || isUntradeableItem(entry.getKey())))
+            if (gainedQuantity > 0 && (npcRewardWindowActive || (isUntradeableItem(entry.getKey()) && !isPendingBankWithdrawal(entry.getKey()))))
             {
                 gainedItems.add(new ItemStack(entry.getKey(), gainedQuantity));
             }
@@ -1218,6 +1471,87 @@ public class ParentsGuildPlugin extends Plugin
             debugLog("Could not determine whether item {} is tradable: {}", itemId, ex.getMessage());
             return false;
         }
+    }
+
+    private boolean isPendingBankWithdrawal(int itemId)
+    {
+        final BankWithdrawalInteraction withdrawal = pendingBankWithdrawalInteraction;
+        if (withdrawal == null || withdrawal.getExpiresAtMillis() < System.currentTimeMillis())
+        {
+            pendingBankWithdrawalInteraction = null;
+            return false;
+        }
+
+        try
+        {
+            final ItemComposition item = itemManager.getItemComposition(canonicalItemId(itemId));
+            final String itemName = normalizeName(item != null ? item.getName() : "");
+            if (!withdrawal.getItemName().equals(itemName))
+            {
+                return false;
+            }
+            pendingBankWithdrawalInteraction = null;
+            debugLog("Skipping untradable bank withdrawal for {}", item != null ? item.getName() : itemId);
+            return true;
+        }
+        catch (RuntimeException ex)
+        {
+            debugLog("Could not match bank withdrawal for item {}: {}", itemId, ex.getMessage());
+            return false;
+        }
+    }
+
+    private boolean isRecoveryActive()
+    {
+        if (recoveryInterfaceOpen)
+        {
+            return true;
+        }
+
+        final RecoveryInteraction recovery = pendingRecoveryInteraction;
+        if (recovery == null)
+        {
+            return false;
+        }
+        if (recovery.getExpiresAtMillis() >= System.currentTimeMillis())
+        {
+            return true;
+        }
+
+        pendingRecoveryInteraction = null;
+        return false;
+    }
+
+    private boolean isDirectRecoveryInteraction(String menuOption, String menuTarget)
+    {
+        if (!RECOVERY_TARGET_NAMES.contains(menuTarget))
+        {
+            return false;
+        }
+
+        if ("death".equals(menuTarget))
+        {
+            return "talk-to".equals(menuOption);
+        }
+
+        return "open".equals(menuOption)
+            || "collect".equals(menuOption)
+            || "retrieve".equals(menuOption)
+            || "claim".equals(menuOption);
+    }
+
+    private boolean isRecoveryCollectionOption(String menuOption)
+    {
+        return menuOption.startsWith("take")
+            || "collect".equals(menuOption)
+            || "retrieve".equals(menuOption)
+            || "claim".equals(menuOption);
+    }
+
+    private String recoverySourceName()
+    {
+        final RecoveryInteraction recovery = pendingRecoveryInteraction;
+        return recovery != null ? recovery.getSourceName() : "recovery interface";
     }
 
     private void captureInventorySnapshot()
@@ -2093,6 +2427,18 @@ public class ParentsGuildPlugin extends Plugin
     {
         final String base = resolveEndpointBase(config.websiteBaseUrl());
         return base.isEmpty() ? "" : base + "/api/integrations/clan-panel.php";
+    }
+
+    private String resolvePluginLocationHeartbeatEndpoint()
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() ? "" : base + "/api/integrations/plugin-location.php";
+    }
+
+    private String resolvePluginLocationSettingsEndpoint()
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() ? "" : base + "/api/integrations/plugin-location-settings.php";
     }
 
     private void requestWomPlayerUpdate(String playerRsn)
@@ -3730,6 +4076,20 @@ public class ParentsGuildPlugin extends Plugin
     static class NpcInventoryRewardInteraction
     {
         String npcName;
+        long expiresAtMillis;
+    }
+
+    @Value
+    static class BankWithdrawalInteraction
+    {
+        String itemName;
+        long expiresAtMillis;
+    }
+
+    @Value
+    static class RecoveryInteraction
+    {
+        String sourceName;
         long expiresAtMillis;
     }
 

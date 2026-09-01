@@ -37,6 +37,13 @@ public interface ParentsGuildConfig extends Config
     )
     String displaySection = "display";
 
+    @ConfigSection(
+        name = "Privacy",
+        description = "Optional data shared with the clan website.",
+        position = 5
+    )
+    String privacySection = "privacy";
+
     @ConfigItem(
         keyName = "websiteBaseUrl",
         name = "Website base URL",
@@ -193,6 +200,18 @@ public interface ParentsGuildConfig extends Config
     default boolean twentyFourHourTime()
     {
         return false;
+    }
+
+    @ConfigItem(
+        keyName = "enableLocationHeartbeat",
+        name = "Share live location",
+        description = "Periodically share your current world and map coordinates with the ParentsGuild website.",
+        section = privacySection,
+        position = 0
+    )
+    default boolean enableLocationHeartbeat()
+    {
+        return true;
     }
 
     @ConfigItem(
