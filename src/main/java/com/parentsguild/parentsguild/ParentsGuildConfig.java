@@ -205,7 +205,7 @@ public interface ParentsGuildConfig extends Config
     @ConfigItem(
         keyName = "enableLocationHeartbeat",
         name = "Share live location",
-        description = "Periodically share your current world and map coordinates with the ParentsGuild website.",
+        description = "Periodically share your current world and map coordinates with the ParentsGuild website. Your location is never shared while you are in the Wilderness.",
         section = privacySection,
         position = 0
     )

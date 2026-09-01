@@ -66,6 +66,7 @@ import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.Notifier;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
@@ -982,7 +983,9 @@ public class ParentsGuildPlugin extends Plugin
                 final String playerRsn = currentLocalPlayerName();
                 final WorldPoint location = localPlayer == null ? null : localPlayer.getWorldLocation();
                 final long now = System.currentTimeMillis();
-                if (location == null || playerRsn.isEmpty() || now - lastLocationHeartbeatAtMillis < LOCATION_HEARTBEAT_MIN_GAP_MILLIS)
+                if (client.getVarbitValue(VarbitID.INSIDE_WILDERNESS) > 0
+                    || location == null || playerRsn.isEmpty()
+                    || now - lastLocationHeartbeatAtMillis < LOCATION_HEARTBEAT_MIN_GAP_MILLIS)
                 {
                     return;
                 }
