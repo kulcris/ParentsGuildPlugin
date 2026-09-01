@@ -1002,7 +1002,11 @@ public class ParentsGuildPlugin extends Plugin
             {
                 final Player localPlayer = client.getLocalPlayer();
                 final String playerRsn = currentLocalPlayerName();
-                final WorldPoint location = localPlayer == null ? null : localPlayer.getWorldLocation();
+                final WorldPoint location = localPlayer == null
+                    ? null
+                    : (client.isInInstancedRegion()
+                        ? WorldPoint.fromLocalInstance(client, localPlayer.getLocalLocation())
+                        : localPlayer.getWorldLocation());
                 final long now = System.currentTimeMillis();
                 if (client.getVarbitValue(VarbitID.INSIDE_WILDERNESS) > 0
                     || location == null || playerRsn.isEmpty()
