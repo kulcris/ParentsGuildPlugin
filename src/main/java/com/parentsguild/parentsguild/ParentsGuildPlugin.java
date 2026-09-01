@@ -64,9 +64,12 @@ import net.runelite.api.events.StatChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.WorldEntity;
+import net.runelite.api.WorldView;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.client.Notifier;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
@@ -1002,13 +1005,23 @@ public class ParentsGuildPlugin extends Plugin
             {
                 final Player localPlayer = client.getLocalPlayer();
                 final String playerRsn = currentLocalPlayerName();
-                final WorldPoint location = localPlayer == null
+                final boolean isOnBoat = localPlayer != null && localPlayer.getWorldView().getId() != WorldView.TOPLEVEL;
+                WorldPoint location = localPlayer == null
                     ? null
-                    : (client.isInInstancedRegion()
-                        ? WorldPoint.fromLocalInstance(client, localPlayer.getLocalLocation())
-                        : localPlayer.getWorldLocation());
+                    : WorldPoint.fromLocalInstance(client, localPlayer.getLocalLocation());
+                if (isOnBoat)
+                {
+                    final WorldEntity boat = client.getTopLevelWorldView()
+                        .worldEntities()
+                        .byIndex(localPlayer.getWorldView().getId());
+                    if (boat != null)
+                    {
+                        location = WorldPoint.fromLocalInstance(client, boat.getLocalLocation());
+                    }
+                }
                 final long now = System.currentTimeMillis();
-                if (client.getVarbitValue(VarbitID.INSIDE_WILDERNESS) > 0
+                if (!canShareLocationHeartbeat()
+                    || client.getVarbitValue(VarbitID.INSIDE_WILDERNESS) > 0
                     || location == null || playerRsn.isEmpty()
                     || now - lastLocationHeartbeatAtMillis < LOCATION_HEARTBEAT_MIN_GAP_MILLIS)
                 {
@@ -1022,6 +1035,7 @@ public class ParentsGuildPlugin extends Plugin
                 payload.addProperty("worldX", location.getX());
                 payload.addProperty("worldY", location.getY());
                 payload.addProperty("plane", location.getPlane());
+                payload.addProperty("isOnBoat", isOnBoat);
                 executor.execute(() -> submitLocationHeartbeat(endpoint, payload));
             }
             finally
@@ -1029,6 +1043,12 @@ public class ParentsGuildPlugin extends Plugin
                 locationHeartbeatInFlight.set(false);
             }
         });
+    }
+
+    private boolean canShareLocationHeartbeat()
+    {
+        return client.getClanChannel() != null
+            && client.getVarpValue(VarPlayerID.OPTION_PM) != 2;
     }
 
     private void submitLocationHeartbeat(String endpoint, JsonObject payload)

@@ -39,7 +39,7 @@ public interface ParentsGuildConfig extends Config
 
     @ConfigSection(
         name = "Privacy",
-        description = "Optional data shared with the clan website.",
+        description = "Live location only transmits while you are in the clan chat, Private Chat is On or Friends, and you are outside the Wilderness.",
         position = 5
     )
     String privacySection = "privacy";
@@ -204,8 +204,8 @@ public interface ParentsGuildConfig extends Config
 
     @ConfigItem(
         keyName = "enableLocationHeartbeat",
-        name = "Share live location",
-        description = "Periodically share your current world and map coordinates with the ParentsGuild website. Your location is never shared while you are in the Wilderness.",
+        name = "<html><b>Location sharing requirements</b><br>Clan chat joined; Private Chat On or Friends;<br>never shared in the Wilderness.<br><br>Share live location</html>",
+        description = "Periodically share your current world and map coordinates with the ParentsGuild website when the Privacy requirements above are met.",
         section = privacySection,
         position = 0
     )
