@@ -1751,7 +1751,17 @@ public class ParentsGuildPlugin extends Plugin
 
     private DropLocation captureDropLocation(Player localPlayer)
     {
-        final WorldPoint location = localPlayer.getWorldLocation();
+        WorldPoint location = localPlayer.getWorldLocation();
+        if (localPlayer.getWorldView().getId() != WorldView.TOPLEVEL)
+        {
+            final WorldEntity boat = client.getTopLevelWorldView()
+                .worldEntities()
+                .byIndex(localPlayer.getWorldView().getId());
+            if (boat != null)
+            {
+                location = WorldPoint.fromLocalInstance(client, boat.getLocalLocation());
+            }
+        }
         if (location == null)
         {
             return new DropLocation(client.getWorld(), 0, 0, 0);
