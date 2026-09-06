@@ -1,5 +1,6 @@
 package com.parentsguild.parentsguild;
 
+import java.awt.Color;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
@@ -203,8 +204,20 @@ public interface ParentsGuildConfig extends Config
     }
 
     @ConfigItem(
+        keyName = "discordChatTextColor",
+        name = "Discord chat text color",
+        description = "Choose the text color used for Discord messages relayed into clan chat.",
+        section = displaySection,
+        position = 2
+    )
+    default Color discordChatTextColor()
+    {
+        return new Color(0x5865F2);
+    }
+
+    @ConfigItem(
         keyName = "enableLocationHeartbeat",
-        name = "<html><b>Location sharing requirements</b><br>Clan chat joined; Private Chat On or Friends;<br>never shared in the Wilderness.<br><br>Share live location</html>",
+        name = "<html><b>Share live location</b><br><br><b>Only transmits when:</b><br>Clan chat is joined<br>Private Chat is On or Friends<br>You are outside the Wilderness</html>",
         description = "Periodically share your current world and map coordinates with the ParentsGuild website when the Privacy requirements above are met.",
         section = privacySection,
         position = 0

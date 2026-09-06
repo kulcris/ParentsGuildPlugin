@@ -78,6 +78,7 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.game.ChatIconManager;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.game.ItemStack;
 import net.runelite.client.plugins.Plugin;
@@ -127,6 +128,7 @@ public class ParentsGuildPlugin extends Plugin
     private static final long LOCATION_HEARTBEAT_MIN_GAP_MILLIS = TimeUnit.SECONDS.toMillis(30);
     private static final int LOCATION_HEARTBEAT_INTERVAL_SECONDS = 180;
     private static final int BINGO_STATUS_REFRESH_SECONDS = 60;
+    private static final int CLAN_CHAT_RELAY_POLL_SECONDS = 1;
     private static final int[] LOGIN_SYNC_DELAYS_SECONDS = {1, 3, 6};
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
         InventoryID.TRAWLER_REWARDINV, "Reward chest: Fishing trawler reward",
@@ -177,6 +179,9 @@ public class ParentsGuildPlugin extends Plugin
     private DrawManager drawManager;
 
     @Inject
+    private ChatIconManager chatIconManager;
+
+    @Inject
     private ItemManager itemManager;
 
     @Inject
@@ -205,12 +210,15 @@ public class ParentsGuildPlugin extends Plugin
     private final Map<String, Long> metricLocalGains = new ConcurrentHashMap<>();
     private final Map<String, Integer> lastSkillXpByMetricKey = new ConcurrentHashMap<>();
     private final Map<String, Integer> lastAbsoluteMetricCountByKey = new ConcurrentHashMap<>();
+    private final Map<String, Integer> clanChatRankIconIds = new ConcurrentHashMap<>();
+    private final Map<String, Long> recentInjectedDiscordMessages = new ConcurrentHashMap<>();
     private final Set<String> metricWomUpdateReminderTileIds = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean womRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoStatusRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoBoardRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoBoardImageRefreshQueued = new AtomicBoolean(false);
     private final AtomicBoolean locationHeartbeatInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean clanChatRelayPollInFlight = new AtomicBoolean(false);
     private volatile long lastConfigWarningAtMillis = 0L;
     private volatile long dropTileEligibilityCacheAtMillis = 0L;
     private volatile Set<Integer> dropTileEligibilityCache = new HashSet<>();
@@ -219,21 +227,27 @@ public class ParentsGuildPlugin extends Plugin
     private volatile NpcInventoryRewardInteraction pendingNpcInventoryRewardInteraction;
     private volatile StorageWithdrawalInteraction pendingStorageWithdrawalInteraction;
     private volatile RecoveryInteraction pendingRecoveryInteraction;
+    private volatile long clueStashInteractionExpiresAtMillis;
     private volatile boolean recoveryInterfaceOpen;
     private volatile boolean storageInterfaceOpen;
     private volatile long lastLocationHeartbeatAtMillis;
     private volatile int locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
     private volatile boolean inventorySnapshotInitialized;
+    private volatile long clanChatRelayCursor;
+    private volatile boolean clanChatRelayCursorInitialized;
+    private volatile int discordChatIconId = -1;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
     private volatile BingoBoardState bingoBoardState = BingoBoardState.hidden();
     private volatile boolean bingoBoardOverlayEnabled = false;
     private ScheduledExecutorService womExecutor;
+    private ScheduledExecutorService clanChatRelayExecutor;
     private ScheduledFuture<?> womRefreshTask;
     private ScheduledFuture<?> bingoStatusTask;
     private ScheduledFuture<?> bingoBoardTask;
     private ScheduledFuture<?> locationHeartbeatTask;
     private ScheduledFuture<?> locationSettingsTask;
+    private ScheduledFuture<?> clanChatRelayTask;
     private ParentsGuildPanel womPanel;
     private NavigationButton womNavigationButton;
     private ParentsGuildBingoOverlay bingoOverlay;
@@ -260,6 +274,7 @@ public class ParentsGuildPlugin extends Plugin
         pendingNpcInventoryRewardInteraction = null;
         pendingStorageWithdrawalInteraction = null;
         pendingRecoveryInteraction = null;
+        clueStashInteractionExpiresAtMillis = 0L;
         recoveryInterfaceOpen = false;
         storageInterfaceOpen = false;
         inventorySnapshotInitialized = false;
@@ -278,14 +293,25 @@ public class ParentsGuildPlugin extends Plugin
         bingoBoardRefreshInFlight.set(false);
         bingoBoardImageRefreshQueued.set(false);
         locationHeartbeatInFlight.set(false);
+        clanChatRelayPollInFlight.set(false);
+        clanChatRankIconIds.clear();
+        recentInjectedDiscordMessages.clear();
+        discordChatIconId = -1;
         lastLocationHeartbeatAtMillis = 0L;
         locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
+        clanChatRelayCursor = 0L;
+        clanChatRelayCursorInitialized = false;
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardOverlayEnabled = false;
         womExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             final Thread thread = new Thread(runnable, "parentsguild-wom");
+            thread.setDaemon(true);
+            return thread;
+        });
+        clanChatRelayExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            final Thread thread = new Thread(runnable, "parentsguild-clan-chat");
             thread.setDaemon(true);
             return thread;
         });
@@ -300,6 +326,7 @@ public class ParentsGuildPlugin extends Plugin
         rescheduleBingoBoardRefresh();
         rescheduleLocationHeartbeat();
         rescheduleLocationSettingsRefresh();
+        rescheduleClanChatRelay();
         requestPluginLocationSettings();
         requestWomRefresh(true);
         if (client.getGameState() == GameState.LOGGED_IN)
@@ -320,6 +347,7 @@ public class ParentsGuildPlugin extends Plugin
         pendingNpcInventoryRewardInteraction = null;
         pendingStorageWithdrawalInteraction = null;
         pendingRecoveryInteraction = null;
+        clueStashInteractionExpiresAtMillis = 0L;
         recoveryInterfaceOpen = false;
         storageInterfaceOpen = false;
         inventorySnapshotInitialized = false;
@@ -334,8 +362,14 @@ public class ParentsGuildPlugin extends Plugin
         bingoBoardRefreshInFlight.set(false);
         bingoBoardImageRefreshQueued.set(false);
         locationHeartbeatInFlight.set(false);
+        clanChatRelayPollInFlight.set(false);
+        clanChatRankIconIds.clear();
+        recentInjectedDiscordMessages.clear();
+        discordChatIconId = -1;
         lastLocationHeartbeatAtMillis = 0L;
         locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
+        clanChatRelayCursor = 0L;
+        clanChatRelayCursorInitialized = false;
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardOverlayEnabled = false;
@@ -364,10 +398,20 @@ public class ParentsGuildPlugin extends Plugin
             locationSettingsTask.cancel(true);
             locationSettingsTask = null;
         }
+        if (clanChatRelayTask != null)
+        {
+            clanChatRelayTask.cancel(true);
+            clanChatRelayTask = null;
+        }
         if (womExecutor != null)
         {
             womExecutor.shutdownNow();
             womExecutor = null;
+        }
+        if (clanChatRelayExecutor != null)
+        {
+            clanChatRelayExecutor.shutdownNow();
+            clanChatRelayExecutor = null;
         }
         if (womNavigationButton != null)
         {
@@ -402,6 +446,7 @@ public class ParentsGuildPlugin extends Plugin
         rescheduleBingoBoardRefresh();
         rescheduleLocationHeartbeat();
         rescheduleLocationSettingsRefresh();
+        rescheduleClanChatRelay();
         requestPluginLocationSettings();
         requestLocationHeartbeat();
         requestWomRefresh(true);
@@ -454,6 +499,7 @@ public class ParentsGuildPlugin extends Plugin
     public void onChatMessage(ChatMessage event)
     {
         handleMetricChatMessage(event);
+        handleClanChatRelayOutgoing(event);
     }
 
     private void handleStatChanged(StatChanged event)
@@ -514,6 +560,75 @@ public class ParentsGuildPlugin extends Plugin
             if (count > 0 && !tier.isEmpty())
             {
                 applyAbsoluteMetricCount("activity:clue_scrolls_" + tier, count, tier + " clues");
+            }
+        }
+    }
+
+    private void handleClanChatRelayOutgoing(ChatMessage event)
+    {
+        if (event == null || clanChatRelayExecutor == null)
+        {
+            return;
+        }
+
+        String senderName = cleanText(event.getName());
+        if (senderName.isEmpty())
+        {
+            senderName = cleanText(event.getSender());
+        }
+        final String message = cleanText(event.getMessage());
+        final boolean guestMessage = event.getType() == ChatMessageType.CLAN_GUEST_CHAT;
+        final boolean memberMessage = event.getType() == ChatMessageType.CLAN_CHAT || guestMessage;
+        final boolean achievementBroadcast = event.getType() == ChatMessageType.CLAN_MESSAGE && !isClanChatInstruction(message);
+        if ((!memberMessage && !achievementBroadcast) || message.isEmpty() || isRecentInjectedDiscordMessage(senderName, message) || (memberMessage && senderName.isEmpty()))
+        {
+            return;
+        }
+
+        final String endpoint = resolveClanChatRelayEndpoint();
+        if (endpoint.isEmpty())
+        {
+            return;
+        }
+
+        final String relayRsn = currentLocalPlayerName();
+        final String resolvedSenderName = senderName;
+        clanChatRelayExecutor.execute(() -> submitClanChatRelayMessage(endpoint, achievementBroadcast ? "Clan Achievement" : resolvedSenderName, message, achievementBroadcast, guestMessage, relayRsn));
+    }
+
+    private static boolean isClanChatInstruction(String message)
+    {
+        final String normalized = normalizeName(message);
+        return normalized.startsWith("to talk in your clan's channel");
+    }
+
+    private void submitClanChatRelayMessage(String endpoint, String senderName, String message, boolean system, boolean guest, String relayRsn)
+    {
+        final JsonObject payload = new JsonObject();
+        payload.addProperty("source", "plugin");
+        payload.addProperty("senderName", senderName);
+        payload.addProperty("message", message);
+        payload.addProperty("system", system);
+        payload.addProperty("guest", guest);
+        payload.addProperty("relayRsn", relayRsn);
+        final Request request = new Request.Builder()
+            .url(endpoint)
+            .header("Accept", "application/json")
+            .post(RequestBody.create(JSON, gson.toJson(payload)))
+            .build();
+
+        try (Response response = okHttpClient.newCall(request).execute())
+        {
+            if (!response.isSuccessful() && config.debug())
+            {
+                log.debug("Clan chat relay returned HTTP {}", response.code());
+            }
+        }
+        catch (IOException ex)
+        {
+            if (config.debug())
+            {
+                log.debug("Clan chat relay submission failed", ex);
             }
         }
     }
@@ -703,6 +818,12 @@ public class ParentsGuildPlugin extends Plugin
 
         final String normalizedMenuOption = normalizeName(menuOption);
         final String normalizedMenuTarget = normalizeName(menuTarget);
+        final boolean stashInteraction = normalizedMenuTarget.contains("stash") || "uri".equals(normalizedMenuTarget);
+        if (stashInteraction)
+        {
+            captureInventorySnapshot();
+            clueStashInteractionExpiresAtMillis = System.currentTimeMillis() + NPC_INVENTORY_REWARD_WINDOW_MILLIS;
+        }
         final boolean recoveryInteraction = isDirectRecoveryInteraction(normalizedMenuOption, normalizedMenuTarget)
             || (recoveryInterfaceOpen && isRecoveryCollectionOption(normalizedMenuOption));
         if (recoveryInteraction)
@@ -717,7 +838,7 @@ public class ParentsGuildPlugin extends Plugin
         final boolean npcRewardInteraction = "Talk-to".equalsIgnoreCase(menuOption) && !menuTarget.isEmpty();
         final boolean lootChestInteraction = "Open".equalsIgnoreCase(menuOption)
             && INVENTORY_LOOT_CHEST_NAMES.contains(normalizeName(menuTarget));
-        if (!recoveryInteraction && (npcRewardInteraction || lootChestInteraction))
+        if (!recoveryInteraction && !stashInteraction && (npcRewardInteraction || lootChestInteraction))
         {
             captureInventorySnapshot();
             pendingNpcInventoryRewardInteraction = new NpcInventoryRewardInteraction(
@@ -1077,6 +1198,199 @@ public class ParentsGuildPlugin extends Plugin
         return configuredInterval > 0
             ? Math.max(60, Math.min(900, configuredInterval))
             : LOCATION_HEARTBEAT_INTERVAL_SECONDS;
+    }
+
+    // Clan chat relay
+
+    private void rescheduleClanChatRelay()
+    {
+        if (clanChatRelayTask != null)
+        {
+            clanChatRelayTask.cancel(false);
+            clanChatRelayTask = null;
+        }
+        clanChatRelayCursor = 0L;
+        clanChatRelayCursorInitialized = false;
+
+        if (clanChatRelayExecutor == null || resolveClanChatRelayEndpoint().isEmpty())
+        {
+            return;
+        }
+
+        clanChatRelayTask = clanChatRelayExecutor.scheduleWithFixedDelay(
+            this::requestClanChatRelayMessages,
+            1,
+            CLAN_CHAT_RELAY_POLL_SECONDS,
+            TimeUnit.SECONDS
+        );
+    }
+
+    private void requestClanChatRelayMessages()
+    {
+        if (!clanChatRelayPollInFlight.compareAndSet(false, true))
+        {
+            return;
+        }
+
+        try
+        {
+            final String playerRsn = currentLocalPlayerName();
+            final String endpoint = resolveClanChatRelayEndpoint();
+            if (playerRsn.isEmpty() || endpoint.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
+            {
+                return;
+            }
+
+            final String url = endpoint
+                + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString())
+                + "&after=" + clanChatRelayCursor;
+            final JsonObject payload = getJsonObject(url);
+            if (!jsonBoolean(payload, "enabled"))
+            {
+                clanChatRelayCursorInitialized = false;
+                return;
+            }
+
+            final long nextCursor = Math.max(clanChatRelayCursor, jsonLong(payload, "cursor"));
+            if (!clanChatRelayCursorInitialized)
+            {
+                clanChatRelayCursor = nextCursor;
+                clanChatRelayCursorInitialized = true;
+                return;
+            }
+
+            for (JsonElement element : jsonArray(payload, "messages"))
+            {
+                if (!element.isJsonObject())
+                {
+                    continue;
+                }
+                final JsonObject message = element.getAsJsonObject();
+                final String senderName = cleanText(jsonString(message, "senderName"));
+                final String rankName = cleanText(jsonString(message, "rankName"));
+                final String text = cleanText(jsonString(message, "message"));
+                if (senderName.isEmpty() || text.isEmpty())
+                {
+                    continue;
+                }
+                displayDiscordClanChatMessage(senderName, rankName, text);
+            }
+            clanChatRelayCursor = nextCursor;
+        }
+        catch (Exception ex)
+        {
+            if (config.debug())
+            {
+                log.debug("Clan chat relay poll failed", ex);
+            }
+        }
+        finally
+        {
+            clanChatRelayPollInFlight.set(false);
+        }
+    }
+
+    private void displayDiscordClanChatMessage(String senderName, String rankName, String message)
+    {
+        final BufferedImage rankIcon = rankName.isEmpty() ? null : loadRemoteImage(resolveClanRankIconEndpoint(rankName));
+        clientThread.invoke(() -> {
+            rememberInjectedDiscordMessage(senderName, message);
+            rememberInjectedDiscordMessage("[ParentsGuild] " + senderName, message);
+            final String rankTag = registerClanChatRankIcon(rankName, rankIcon);
+            final String discordTag = registerDiscordChatIcon();
+            client.addChatMessage(
+                ChatMessageType.CLAN_MESSAGE,
+                "",
+                rankTag + discordTag + " <col=" + colorHex(config.discordChatTextColor()) + ">" + senderName + ": " + message + "</col>",
+                "ParentsGuild",
+                false
+            );
+        });
+    }
+
+    private String registerClanChatRankIcon(String rankName, BufferedImage image)
+    {
+        if (rankName.isEmpty() || image == null)
+        {
+            return "";
+        }
+
+        final int iconId = clanChatRankIconIds.computeIfAbsent(normalizeName(rankName), ignored -> {
+            final int reservedIconId = chatIconManager.reserveChatIcon();
+            chatIconManager.updateChatIcon(reservedIconId, ImageUtil.outlineImage(image, new Color(33, 33, 33)));
+            return reservedIconId;
+        });
+        return chatIconTag(iconId);
+    }
+
+    private String registerDiscordChatIcon()
+    {
+        if (discordChatIconId < 0)
+        {
+            discordChatIconId = chatIconManager.reserveChatIcon();
+            chatIconManager.updateChatIcon(discordChatIconId, createDiscordChatIcon());
+        }
+        return chatIconTag(discordChatIconId);
+    }
+
+    private String chatIconTag(int registeredIconId)
+    {
+        final int spriteIndex = chatIconManager.chatIconIndex(registeredIconId);
+        return spriteIndex < 0 ? "" : "<img=" + spriteIndex + ">";
+    }
+
+    private static BufferedImage createDiscordChatIcon()
+    {
+        final BufferedImage image = new BufferedImage(13, 13, BufferedImage.TYPE_INT_ARGB);
+        final Graphics2D graphics = image.createGraphics();
+        try
+        {
+            graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            graphics.setColor(new Color(88, 101, 242));
+            graphics.fillRoundRect(1, 1, 11, 8, 4, 4);
+            graphics.fillPolygon(new int[]{5, 6, 7}, new int[]{8, 11, 8}, 3);
+            graphics.setColor(Color.WHITE);
+            graphics.fillOval(4, 4, 2, 2);
+            graphics.fillOval(8, 4, 2, 2);
+            graphics.drawArc(4, 4, 6, 4, 190, 160);
+        }
+        finally
+        {
+            graphics.dispose();
+        }
+        return ImageUtil.outlineImage(image, new Color(33, 33, 33));
+    }
+
+    private static String colorHex(Color color)
+    {
+        final int rgb = (color == null ? 0x5865F2 : color.getRGB()) & 0xFFFFFF;
+        return String.format(Locale.ROOT, "%06x", rgb);
+    }
+
+    private void rememberInjectedDiscordMessage(String senderName, String message)
+    {
+        final long now = System.currentTimeMillis();
+        recentInjectedDiscordMessages.entrySet().removeIf(entry -> entry.getValue() < now);
+        recentInjectedDiscordMessages.put(clanChatRelayMessageKey(senderName, message), now + TimeUnit.MINUTES.toMillis(1));
+    }
+
+    private boolean isRecentInjectedDiscordMessage(String senderName, String message)
+    {
+        final long now = System.currentTimeMillis();
+        final String key = clanChatRelayMessageKey(senderName, message);
+        final Long expiresAt = recentInjectedDiscordMessages.get(key);
+        if (expiresAt == null || expiresAt < now)
+        {
+            recentInjectedDiscordMessages.remove(key);
+            return false;
+        }
+        recentInjectedDiscordMessages.remove(key);
+        return true;
+    }
+
+    private static String clanChatRelayMessageKey(String senderName, String message)
+    {
+        return normalizeName(senderName) + "|" + normalizeName(message);
     }
 
     // Bingo status overlay refresh
@@ -1493,6 +1807,14 @@ public class ParentsGuildPlugin extends Plugin
             inventorySnapshot.putAll(currentItems);
             return;
         }
+        if (clueStashInteractionExpiresAtMillis >= System.currentTimeMillis())
+        {
+            debugLog("Skipping inventory gains from stash interaction");
+            inventorySnapshot.clear();
+            inventorySnapshot.putAll(currentItems);
+            return;
+        }
+        clueStashInteractionExpiresAtMillis = 0L;
 
         final List<ItemStack> gainedItems = new ArrayList<>();
         for (Map.Entry<Integer, Integer> entry : currentItems.entrySet())
@@ -2505,6 +2827,20 @@ public class ParentsGuildPlugin extends Plugin
     {
         final String base = resolveEndpointBase(config.websiteBaseUrl());
         return base.isEmpty() ? "" : base + "/api/integrations/plugin-location-settings.php";
+    }
+
+    private String resolveClanChatRelayEndpoint()
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() ? "" : base + "/api/integrations/clan-chat.php";
+    }
+
+    private String resolveClanRankIconEndpoint(String rankName)
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() || rankName.isEmpty()
+            ? ""
+            : base + "/api/integrations/clan-rank-icon.php?rank=" + urlEncode(rankName);
     }
 
     private void requestWomPlayerUpdate(String playerRsn)
