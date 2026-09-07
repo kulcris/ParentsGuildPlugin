@@ -26,7 +26,6 @@ RuneLite external plugin for clan website workflows:
 - Clan chat relay to Discord, including clan guests and clan achievement broadcasts.
 - Discord-to-clan-chat relay with clan-rank icons, configurable Discord message color, duplicate suppression, and no backlog replay after login.
 - Player display preferences for DD/MM/YY dates and 24-hour time.
-- Debug logging for integration troubleshooting.
 
 ## Plugin Config
 
@@ -46,13 +45,3 @@ RuneLite external plugin for clan website workflows:
 - `Discord chat text color`
 - `Share live location`
 - `Debug logging`
-
-## Server Requirements
-
-- Authenticate and authorize every submission server-side. The RuneLite client and all submitted RSNs, timestamps, item IDs, coordinates, and screenshots are untrusted input.
-- Match a logged-in RSN to an active clan roster before returning private panel, Bingo, location, or relay data.
-- Treat `eventId` values as idempotency keys and reject duplicate claims instead of awarding or storing them twice.
-- Validate uploaded images, set upload-size limits, strip metadata, and store files outside publicly executable paths.
-- Verify Bingo rules, item eligibility, ownership requirements, and completion state on the server. Never approve a claim solely because the plugin submitted it.
-- Keep location sharing player-controlled. The plugin suppresses Wilderness locations before building a request; the server should enforce the same rule and retain only data your clan needs.
-- Return safe JSON errors. Do not expose stack traces, database errors, tokens, Discord secrets, or roster data to the plugin.
