@@ -579,7 +579,9 @@ public class ParentsGuildPlugin extends Plugin
         final String message = cleanText(event.getMessage());
         final boolean guestMessage = event.getType() == ChatMessageType.CLAN_GUEST_CHAT;
         final boolean memberMessage = event.getType() == ChatMessageType.CLAN_CHAT || guestMessage;
-        final boolean achievementBroadcast = event.getType() == ChatMessageType.CLAN_MESSAGE && !isClanChatInstruction(message);
+        final boolean achievementBroadcast = event.getType() == ChatMessageType.CLAN_MESSAGE
+            && !isClanChatInstruction(message)
+            && !isGroupIronmanAnnouncement(message);
         if ((!memberMessage && !achievementBroadcast) || message.isEmpty() || isRecentInjectedDiscordMessage(senderName, message) || (memberMessage && senderName.isEmpty()))
         {
             return;
@@ -600,6 +602,12 @@ public class ParentsGuildPlugin extends Plugin
     {
         final String normalized = normalizeName(message);
         return normalized.startsWith("to talk in your clan's channel");
+    }
+
+    private static boolean isGroupIronmanAnnouncement(String message)
+    {
+        final String normalized = normalizeName(message);
+        return normalized.contains("group ironman") || normalized.contains("groupim");
     }
 
     private void submitClanChatRelayMessage(String endpoint, String senderName, String message, boolean system, boolean guest, String relayRsn)
