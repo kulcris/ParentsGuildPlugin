@@ -523,18 +523,32 @@ class ParentsGuildPanel extends PluginPanel
         return label;
     }
 
-    private JLabel wrapLabel(String text)
+    private JTextArea wrapLabel(String text)
     {
-        final JLabel label = new JLabel("<html><body style='width: 175px'>" + escapeHtml(text).replace("\n", "<br>") + "</body></html>");
-        label.setAlignmentX(LEFT_ALIGNMENT);
-        return label;
+        return wrappedTextArea(text);
     }
 
-    private JLabel wrapProfileLine(String label, String value)
+    private JTextArea wrapProfileLine(String label, String value)
     {
-        final JLabel line = new JLabel("<html><body style='width: 175px'>" + escapeHtml(label) + ": " + escapeHtml(value == null || value.trim().isEmpty() ? "-" : value) + "</body></html>");
-        line.setAlignmentX(LEFT_ALIGNMENT);
-        return line;
+        return wrappedTextArea(label + ": " + (value == null || value.trim().isEmpty() ? "-" : value));
+    }
+
+    private JTextArea wrappedTextArea(String text)
+    {
+        final JTextArea area = new JTextArea(text == null ? "" : text);
+        area.setEditable(false);
+        area.setFocusable(false);
+        area.setOpaque(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setFont(new JLabel().getFont());
+        area.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+        area.setAlignmentX(LEFT_ALIGNMENT);
+        area.setSize(new Dimension(198, Short.MAX_VALUE));
+        final Dimension preferredSize = area.getPreferredSize();
+        area.setPreferredSize(new Dimension(198, preferredSize.height));
+        area.setMaximumSize(new Dimension(198, preferredSize.height));
+        return area;
     }
 
     private JButton linkButton(String label, Runnable action)
@@ -688,15 +702,7 @@ class ParentsGuildPanel extends PluginPanel
         final JLabel metricLabel = new JLabel(metricText(competition));
         metricLabel.setAlignmentX(LEFT_ALIGNMENT);
 
-        final JTextArea leaderboard = new JTextArea(buildLeaderboardText(competition.getLeaderboardEntries()));
-        leaderboard.setEditable(false);
-        leaderboard.setFocusable(false);
-        leaderboard.setOpaque(false);
-        leaderboard.setLineWrap(false);
-        leaderboard.setWrapStyleWord(false);
-        leaderboard.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        leaderboard.setAlignmentX(LEFT_ALIGNMENT);
-        leaderboard.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+        final JPanel leaderboard = createLeaderboardPanel(competition.getLeaderboardEntries(), competition.getMetric());
 
         card.add(titleLabel);
         card.add(Box.createVerticalStrut(4));
@@ -713,8 +719,8 @@ class ParentsGuildPanel extends PluginPanel
             youLabel.setAlignmentX(LEFT_ALIGNMENT);
             card.add(Box.createVerticalStrut(8));
             card.add(youLabel);
-            card.add(profileLine("Gained", ParentsGuildPlugin.formatMetricValue(competition.getLocalPlayerEntry().getGained())));
-            card.add(profileLine("Gap to next", ParentsGuildPlugin.formatMetricValue(competition.getGapToNext())));
+            card.add(profileLine("Gained", ParentsGuildPlugin.formatWomLeaderboardValue(competition.getMetric(), competition.getLocalPlayerEntry().getGained())));
+            card.add(profileLine("Gap to next", ParentsGuildPlugin.formatWomLeaderboardValue(competition.getMetric(), competition.getGapToNext())));
         }
         card.add(Box.createVerticalStrut(6));
         card.add(linkButton("Open WOM Event", () -> plugin.openWomCompetition(competition.getId())));
@@ -728,15 +734,7 @@ class ParentsGuildPanel extends PluginPanel
         final JLabel metricLabel = new JLabel(metricText(competition));
         metricLabel.setAlignmentX(LEFT_ALIGNMENT);
 
-        final JTextArea leaderboard = new JTextArea(buildLeaderboardText(competition.getLeaderboardEntries()));
-        leaderboard.setEditable(false);
-        leaderboard.setFocusable(false);
-        leaderboard.setOpaque(false);
-        leaderboard.setLineWrap(false);
-        leaderboard.setWrapStyleWord(false);
-        leaderboard.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        leaderboard.setAlignmentX(LEFT_ALIGNMENT);
-        leaderboard.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+        final JPanel leaderboard = createLeaderboardPanel(competition.getLeaderboardEntries(), competition.getMetric());
 
         card.add(Box.createVerticalStrut(10));
         card.add(sectionLabel("WOM Leaderboard"));
@@ -751,8 +749,8 @@ class ParentsGuildPanel extends PluginPanel
             youLabel.setAlignmentX(LEFT_ALIGNMENT);
             card.add(Box.createVerticalStrut(8));
             card.add(youLabel);
-            card.add(profileLine("Gained", ParentsGuildPlugin.formatMetricValue(competition.getLocalPlayerEntry().getGained())));
-            card.add(profileLine("Gap to next", ParentsGuildPlugin.formatMetricValue(competition.getGapToNext())));
+            card.add(profileLine("Gained", ParentsGuildPlugin.formatWomLeaderboardValue(competition.getMetric(), competition.getLocalPlayerEntry().getGained())));
+            card.add(profileLine("Gap to next", ParentsGuildPlugin.formatWomLeaderboardValue(competition.getMetric(), competition.getGapToNext())));
         }
     }
 
@@ -882,55 +880,41 @@ class ParentsGuildPanel extends PluginPanel
         return metric + "  |  " + competition.getTimeRemainingText();
     }
 
-    private static String buildLeaderboardText(List<ParentsGuildPlugin.LeaderboardEntry> entries)
+    private static JPanel createLeaderboardPanel(List<ParentsGuildPlugin.LeaderboardEntry> entries, String metric)
     {
-        final StringBuilder builder = new StringBuilder();
+        final JPanel leaderboard = new JPanel();
+        leaderboard.setLayout(new BoxLayout(leaderboard, BoxLayout.Y_AXIS));
+        leaderboard.setOpaque(false);
+        leaderboard.setAlignmentX(LEFT_ALIGNMENT);
+
+        if (entries.isEmpty())
+        {
+            final JLabel emptyLabel = new JLabel("No participant data available.");
+            emptyLabel.setAlignmentX(LEFT_ALIGNMENT);
+            leaderboard.add(emptyLabel);
+        }
+
         for (ParentsGuildPlugin.LeaderboardEntry entry : entries)
         {
             final String label = entry.isLocalPlayer() ? entry.getDisplayName() + " *" : entry.getDisplayName();
-            final String gained = "+" + ParentsGuildPlugin.formatMetricValue(entry.getGained());
-            builder.append(padRight("#" + entry.getRank(), 4))
-                .append(" ")
-                .append(padRight(label, 13))
-                .append(" ")
-                .append(padLeft(gained, 6))
-                .append('\n');
-        }
-        return builder.length() == 0 ? "No participant data available." : builder.toString().trim();
-    }
+            final JLabel identity = new JLabel("#" + entry.getRank() + "  " + label);
+            identity.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
 
-    private static String padRight(String value, int width)
-    {
-        final String text = value == null ? "" : value;
-        if (text.length() >= width)
-        {
-            return text.substring(0, width);
+            final JLabel gained = new JLabel("+" + ParentsGuildPlugin.formatWomLeaderboardValue(metric, entry.getGained()), SwingConstants.RIGHT);
+            gained.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+            gained.setToolTipText("Full value: +" + ParentsGuildPlugin.formatMetricValue(entry.getGained()));
+
+            final JPanel row = new JPanel(new BorderLayout(4, 0));
+            row.setOpaque(false);
+            row.setAlignmentX(LEFT_ALIGNMENT);
+            row.add(identity, BorderLayout.WEST);
+            row.add(gained, BorderLayout.CENTER);
+            row.setMaximumSize(new Dimension(Integer.MAX_VALUE, gained.getPreferredSize().height));
+            leaderboard.add(row);
         }
 
-        final StringBuilder builder = new StringBuilder(width);
-        builder.append(text);
-        while (builder.length() < width)
-        {
-            builder.append(' ');
-        }
-        return builder.toString();
-    }
-
-    private static String padLeft(String value, int width)
-    {
-        final String text = value == null ? "" : value;
-        if (text.length() >= width)
-        {
-            return text;
-        }
-
-        final StringBuilder builder = new StringBuilder(width);
-        while (builder.length() + text.length() < width)
-        {
-            builder.append(' ');
-        }
-        builder.append(text);
-        return builder.toString();
+        leaderboard.setMaximumSize(new Dimension(Integer.MAX_VALUE, leaderboard.getPreferredSize().height));
+        return leaderboard;
     }
 
     // Nested scroll and timeline components

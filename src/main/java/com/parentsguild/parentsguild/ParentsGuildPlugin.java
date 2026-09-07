@@ -1243,7 +1243,8 @@ public class ParentsGuildPlugin extends Plugin
 
             final String url = endpoint
                 + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString())
-                + "&after=" + clanChatRelayCursor;
+                + "&after=" + clanChatRelayCursor
+                + (clanChatRelayCursorInitialized ? "" : "&skipExisting=1");
             final JsonObject payload = getJsonObject(url);
             if (!jsonBoolean(payload, "enabled"))
             {
@@ -4056,6 +4057,20 @@ public class ParentsGuildPlugin extends Plugin
         return DECIMAL_FORMATS.DECIMAL.format(value);
     }
 
+    static String formatWomLeaderboardValue(String metric, double value)
+    {
+        final double absoluteValue = Math.abs(value);
+        if (absoluteValue >= 1_000_000D)
+        {
+            return DECIMAL_FORMATS.TWO_DECIMAL.format(value / 1_000_000D) + "m";
+        }
+        if (absoluteValue >= 1_000D)
+        {
+            return DECIMAL_FORMATS.TWO_DECIMAL.format(value / 1_000D) + "k";
+        }
+        return DECIMAL_FORMATS.INTEGER.format(value);
+    }
+
     static String describeTimeRemaining(Instant now, Instant endsAt)
     {
         final Duration duration = Duration.between(now, endsAt);
@@ -4240,6 +4255,7 @@ public class ParentsGuildPlugin extends Plugin
         private static final DecimalFormat INTEGER = new DecimalFormat("#,##0");
         private static final DecimalFormat ONE_DECIMAL = new DecimalFormat("#,##0.#");
         private static final DecimalFormat DECIMAL = new DecimalFormat("#,##0.##");
+        private static final DecimalFormat TWO_DECIMAL = new DecimalFormat("0.00");
     }
 
     // State models
