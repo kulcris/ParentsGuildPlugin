@@ -64,6 +64,7 @@ import net.runelite.api.events.StatChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.clan.ClanChannel;
 import net.runelite.api.WorldEntity;
 import net.runelite.api.WorldView;
 import net.runelite.api.gameval.InventoryID;
@@ -235,6 +236,7 @@ public class ParentsGuildPlugin extends Plugin
     private volatile boolean inventorySnapshotInitialized;
     private volatile long clanChatRelayCursor;
     private volatile boolean clanChatRelayCursorInitialized;
+    private volatile String clanChatRelayClanName = "";
     private volatile int discordChatIconId = -1;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
@@ -301,6 +303,7 @@ public class ParentsGuildPlugin extends Plugin
         locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
         clanChatRelayCursor = 0L;
         clanChatRelayCursorInitialized = false;
+        clanChatRelayClanName = "";
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
@@ -370,6 +373,7 @@ public class ParentsGuildPlugin extends Plugin
         locationHeartbeatIntervalSeconds = LOCATION_HEARTBEAT_INTERVAL_SECONDS;
         clanChatRelayCursor = 0L;
         clanChatRelayCursorInitialized = false;
+        clanChatRelayClanName = "";
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardOverlayEnabled = false;
@@ -577,9 +581,10 @@ public class ParentsGuildPlugin extends Plugin
             senderName = cleanText(event.getSender());
         }
         final String message = cleanText(event.getMessage());
-        final boolean guestMessage = event.getType() == ChatMessageType.CLAN_GUEST_CHAT;
-        final boolean memberMessage = event.getType() == ChatMessageType.CLAN_CHAT || guestMessage;
+        final boolean memberMessage = (event.getType() == ChatMessageType.CLAN_CHAT || event.getType() == ChatMessageType.CLAN_GUEST_CHAT)
+            && isConfiguredClanChatChannel(event.getType());
         final boolean achievementBroadcast = event.getType() == ChatMessageType.CLAN_MESSAGE
+            && isConfiguredClanChatChannel(ChatMessageType.CLAN_CHAT)
             && !isClanChatInstruction(message)
             && !isGroupIronmanAnnouncement(message);
         if ((!memberMessage && !achievementBroadcast) || message.isEmpty() || isRecentInjectedDiscordMessage(senderName, message) || (memberMessage && senderName.isEmpty()))
@@ -595,7 +600,7 @@ public class ParentsGuildPlugin extends Plugin
 
         final String relayRsn = currentLocalPlayerName();
         final String resolvedSenderName = senderName;
-        clanChatRelayExecutor.execute(() -> submitClanChatRelayMessage(endpoint, achievementBroadcast ? "Clan Achievement" : resolvedSenderName, message, achievementBroadcast, guestMessage, relayRsn));
+        clanChatRelayExecutor.execute(() -> submitClanChatRelayMessage(endpoint, achievementBroadcast ? "Clan Achievement" : resolvedSenderName, message, achievementBroadcast, relayRsn));
     }
 
     private static boolean isClanChatInstruction(String message)
@@ -610,14 +615,27 @@ public class ParentsGuildPlugin extends Plugin
         return normalized.contains("group ironman") || normalized.contains("groupim");
     }
 
-    private void submitClanChatRelayMessage(String endpoint, String senderName, String message, boolean system, boolean guest, String relayRsn)
+    private boolean isConfiguredClanChatChannel(ChatMessageType type)
+    {
+        final String expectedName = clanChatRelayClanName;
+        if (expectedName.isEmpty())
+        {
+            return false;
+        }
+
+        final ClanChannel channel = type == ChatMessageType.CLAN_GUEST_CHAT
+            ? client.getGuestClanChannel()
+            : client.getClanChannel();
+        return channel != null && expectedName.equals(normalizeName(channel.getName()));
+    }
+
+    private void submitClanChatRelayMessage(String endpoint, String senderName, String message, boolean system, String relayRsn)
     {
         final JsonObject payload = new JsonObject();
         payload.addProperty("source", "plugin");
         payload.addProperty("senderName", senderName);
         payload.addProperty("message", message);
         payload.addProperty("system", system);
-        payload.addProperty("guest", guest);
         payload.addProperty("relayRsn", relayRsn);
         final Request request = new Request.Builder()
             .url(endpoint)
@@ -1219,6 +1237,7 @@ public class ParentsGuildPlugin extends Plugin
         }
         clanChatRelayCursor = 0L;
         clanChatRelayCursorInitialized = false;
+        clanChatRelayClanName = "";
 
         if (clanChatRelayExecutor == null || resolveClanChatRelayEndpoint().isEmpty())
         {
@@ -1254,6 +1273,7 @@ public class ParentsGuildPlugin extends Plugin
                 + "&after=" + clanChatRelayCursor
                 + (clanChatRelayCursorInitialized ? "" : "&skipExisting=1");
             final JsonObject payload = getJsonObject(url);
+            clanChatRelayClanName = normalizeName(jsonString(payload, "clanName"));
             if (!jsonBoolean(payload, "enabled"))
             {
                 clanChatRelayCursorInitialized = false;
