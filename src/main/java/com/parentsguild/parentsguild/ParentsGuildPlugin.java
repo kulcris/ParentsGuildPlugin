@@ -148,8 +148,14 @@ public class ParentsGuildPlugin extends Plugin
         InterfaceID.DEATH_OFFICE
     );
     private static final Set<Integer> STORAGE_INTERFACE_IDS = Set.of(
+        InterfaceID.BANKMAIN,
+        InterfaceID.BANKSIDE,
+        InterfaceID.SHARED_BANK,
+        InterfaceID.SHARED_BANK_SIDE,
         InterfaceID.CLANS_STORAGE_MAIN,
         InterfaceID.CLANS_STORAGE_SIDE,
+        InterfaceID.POH_COSTUMES,
+        InterfaceID.POH_COSTUMES_SIDE,
         InterfaceID.RAIDS_STORAGE_PRIVATE,
         InterfaceID.RAIDS_STORAGE_SHARED,
         InterfaceID.RAIDS_STORAGE_SIDE,
@@ -1829,7 +1835,7 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        if (storageInterfaceOpen)
+        if (storageInterfaceOpen && !npcRewardWindowActive)
         {
             debugLog("Skipping inventory gains from storage withdrawal");
             inventorySnapshot.clear();
