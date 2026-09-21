@@ -129,7 +129,7 @@ public class ParentsGuildPlugin extends Plugin
     private static final long LOCATION_HEARTBEAT_MIN_GAP_MILLIS = TimeUnit.SECONDS.toMillis(30);
     private static final int LOCATION_HEARTBEAT_INTERVAL_SECONDS = 180;
     private static final int BINGO_STATUS_REFRESH_SECONDS = 60;
-    private static final int CLAN_CHAT_RELAY_POLL_SECONDS = 1;
+    private static final int CLAN_CHAT_RELAY_POLL_SECONDS = 10;
     private static final int[] LOGIN_SYNC_DELAYS_SECONDS = {1, 3, 6};
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
         InventoryID.TRAWLER_REWARDINV, "Reward chest: Fishing trawler reward",
@@ -243,10 +243,12 @@ public class ParentsGuildPlugin extends Plugin
     private volatile long clanChatRelayCursor;
     private volatile boolean clanChatRelayCursorInitialized;
     private volatile String clanChatRelayClanName = "";
+    private volatile int clanChatRelayPollSeconds = CLAN_CHAT_RELAY_POLL_SECONDS;
     private volatile int discordChatIconId = -1;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
     private volatile BingoBoardState bingoBoardState = BingoBoardState.hidden();
+    private volatile String bingoBoardCachedPayload = "";
     private volatile boolean bingoBoardOverlayEnabled = false;
     private ScheduledExecutorService womExecutor;
     private ScheduledExecutorService clanChatRelayExecutor;
@@ -313,6 +315,7 @@ public class ParentsGuildPlugin extends Plugin
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
+        bingoBoardCachedPayload = "";
         bingoBoardOverlayEnabled = false;
         womExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             final Thread thread = new Thread(runnable, "parentsguild-wom");
@@ -382,6 +385,7 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayClanName = "";
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
+        bingoBoardCachedPayload = "";
         bingoBoardOverlayEnabled = false;
         if (womRefreshTask != null)
         {
@@ -495,6 +499,7 @@ public class ParentsGuildPlugin extends Plugin
             lastLoggedInRsn = "";
             bingoOverlayState = BingoOverlayState.hidden();
             bingoBoardState = BingoBoardState.hidden();
+            bingoBoardCachedPayload = "";
             updateBingoBoardPopup();
         }
     }
@@ -1236,14 +1241,23 @@ public class ParentsGuildPlugin extends Plugin
 
     private void rescheduleClanChatRelay()
     {
+        scheduleClanChatRelay(CLAN_CHAT_RELAY_POLL_SECONDS, true);
+    }
+
+    private void scheduleClanChatRelay(int pollSeconds, boolean resetCursor)
+    {
         if (clanChatRelayTask != null)
         {
             clanChatRelayTask.cancel(false);
             clanChatRelayTask = null;
         }
-        clanChatRelayCursor = 0L;
-        clanChatRelayCursorInitialized = false;
-        clanChatRelayClanName = "";
+        clanChatRelayPollSeconds = Math.max(5, Math.min(300, pollSeconds));
+        if (resetCursor)
+        {
+            clanChatRelayCursor = 0L;
+            clanChatRelayCursorInitialized = false;
+            clanChatRelayClanName = "";
+        }
 
         if (clanChatRelayExecutor == null || resolveClanChatRelayEndpoint().isEmpty())
         {
@@ -1253,7 +1267,7 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayTask = clanChatRelayExecutor.scheduleWithFixedDelay(
             this::requestClanChatRelayMessages,
             1,
-            CLAN_CHAT_RELAY_POLL_SECONDS,
+            clanChatRelayPollSeconds,
             TimeUnit.SECONDS
         );
     }
@@ -1280,6 +1294,14 @@ public class ParentsGuildPlugin extends Plugin
                 + (clanChatRelayCursorInitialized ? "" : "&skipExisting=1");
             final JsonObject payload = getJsonObject(url);
             clanChatRelayClanName = normalizeName(jsonString(payload, "clanName"));
+            if (payload.has("pollIntervalSeconds"))
+            {
+                final int configuredPollSeconds = Math.max(5, Math.min(300, jsonInt(payload, "pollIntervalSeconds")));
+                if (configuredPollSeconds != clanChatRelayPollSeconds)
+                {
+                    scheduleClanChatRelay(configuredPollSeconds, false);
+                }
+            }
             if (!jsonBoolean(payload, "enabled"))
             {
                 clanChatRelayCursorInitialized = false;
@@ -1432,31 +1454,7 @@ public class ParentsGuildPlugin extends Plugin
 
     void requestBingoStatusRefresh(boolean manual)
     {
-        if (womExecutor == null)
-        {
-            return;
-        }
-
-        if (!config.showBingoOverlay() && !config.enableBingoDrops())
-        {
-            bingoOverlayState = BingoOverlayState.hidden();
-            return;
-        }
-
-        final String endpoint = resolveBingoStatusEndpoint();
-        final String playerRsn = currentLocalPlayerName();
-        if (endpoint.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
-        {
-            bingoOverlayState = BingoOverlayState.hidden();
-            return;
-        }
-
-        if (!bingoStatusRefreshInFlight.compareAndSet(false, true))
-        {
-            return;
-        }
-
-        womExecutor.execute(() -> refreshBingoStatusState(endpoint, playerRsn, manual));
+        requestBingoBoardRefresh(manual);
     }
 
     private void rescheduleBingoStatusRefresh()
@@ -1574,23 +1572,28 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        if (!bingoBoardOverlayEnabled && !config.enableBingoMetricTracking())
+        final boolean shouldRefreshOverlay = config.showBingoOverlay() || config.enableBingoDrops();
+        final boolean shouldRefreshBoard = bingoBoardOverlayEnabled || config.enableBingoMetricTracking();
+        if (!shouldRefreshOverlay && !shouldRefreshBoard)
         {
             bingoBoardState = BingoBoardState.hidden();
+            bingoBoardCachedPayload = "";
+            bingoOverlayState = BingoOverlayState.hidden();
             updateBingoBoardPopup();
             return;
         }
 
-        final String endpoint = resolveBingoBoardEndpoint();
+        final String endpoint = resolveBingoBoardEndpoint() + "?includeBoard=" + (shouldRefreshBoard ? "1" : "0");
         final String playerRsn = currentLocalPlayerName();
         if (endpoint.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
         {
             bingoBoardState = BingoBoardState.hidden();
+            bingoBoardCachedPayload = "";
             updateBingoBoardPopup();
             return;
         }
 
-        if (!bingoBoardRefreshInFlight.compareAndSet(false, true))
+        if (!bingoStatusRefreshInFlight.compareAndSet(false, true))
         {
             return;
         }
@@ -1718,30 +1721,31 @@ public class ParentsGuildPlugin extends Plugin
             bingoBoardTask = null;
         }
 
-        if (womExecutor == null || (!bingoBoardOverlayEnabled && !config.enableBingoMetricTracking()))
-        {
-            return;
-        }
-
-        bingoBoardTask = womExecutor.scheduleWithFixedDelay(
-            () -> requestBingoBoardRefresh(false),
-            BINGO_STATUS_REFRESH_SECONDS,
-            BINGO_STATUS_REFRESH_SECONDS,
-            TimeUnit.SECONDS
-        );
+        // The status scheduler also refreshes the board when the board is enabled.
     }
 
     private void refreshBingoBoardState(String endpoint, String playerRsn, boolean manual)
     {
         try
         {
-            bingoBoardState = fetchBingoBoardState(endpoint, playerRsn);
-            updateBingoBoardPopup();
+            final BingoOverlayState previousOverlayState = bingoOverlayState;
+            final BingoBoardState nextBoardState = fetchBingoBoardState(endpoint, playerRsn);
+            if (nextBoardState == bingoBoardState && bingoOverlayState.equals(previousOverlayState))
+            {
+                return;
+            }
+
+            if (nextBoardState != bingoBoardState)
+            {
+                bingoBoardState = nextBoardState;
+                updateBingoBoardPopup();
+            }
             pushPanelState();
         }
         catch (Exception ex)
         {
             bingoBoardState = BingoBoardState.hidden();
+            bingoBoardCachedPayload = "";
             updateBingoBoardPopup();
             pushPanelState();
             if (config.debug() || manual)
@@ -1751,7 +1755,7 @@ public class ParentsGuildPlugin extends Plugin
         }
         finally
         {
-            bingoBoardRefreshInFlight.set(false);
+            bingoStatusRefreshInFlight.set(false);
         }
     }
 
@@ -2219,6 +2223,14 @@ public class ParentsGuildPlugin extends Plugin
             return cachedItemIds;
         }
 
+        final Set<Integer> boardItemIds = cachedBingoBoardDropTileItemIds();
+        if (boardItemIds != null)
+        {
+            dropTileEligibilityCache = boardItemIds;
+            dropTileEligibilityCacheAtMillis = now;
+            return boardItemIds;
+        }
+
         final Set<Integer> itemIds = fetchIncompleteDropTileItemIds(boardEndpoint, playerRsn);
         dropTileEligibilityCache = itemIds;
         dropTileEligibilityCacheAtMillis = now;
@@ -2227,7 +2239,7 @@ public class ParentsGuildPlugin extends Plugin
 
     private Set<Integer> fetchIncompleteDropTileItemIds(String endpoint, String playerRsn) throws IOException
     {
-        final String url = endpoint + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
+        final String url = endpoint + (endpoint.contains("?") ? "&" : "?") + "playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
         final Request request = new Request.Builder()
             .url(url)
             .header("Accept", "application/json")
@@ -3346,7 +3358,7 @@ public class ParentsGuildPlugin extends Plugin
 
     private BingoBoardState fetchBingoBoardState(String endpoint, String playerRsn) throws IOException
     {
-        final String url = endpoint + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
+        final String url = endpoint + (endpoint.contains("?") ? "&" : "?") + "playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString());
         final Request request = new Request.Builder()
             .url(url)
             .header("Accept", "application/json")
@@ -3361,6 +3373,27 @@ public class ParentsGuildPlugin extends Plugin
             }
 
             final JsonObject payload = parseResponseJson(responseBody);
+            if (jsonBoolean(payload, "active") && jsonBoolean(payload, "matched"))
+            {
+                final String overlayTimeText = jsonString(payload, "overlayDateTime");
+                bingoOverlayState = overlayTimeText.isEmpty()
+                    ? BingoOverlayState.hidden()
+                    : new BingoOverlayState(true, jsonString(payload, "bingoName"), jsonString(payload, "teamName"), overlayTimeText);
+                handleSubmissionNotifications(jsonArray(payload, "submissionNotifications"), playerRsn);
+                handleCompletionNotifications(jsonArray(payload, "completionNotifications"), playerRsn);
+            }
+            else
+            {
+                bingoOverlayState = BingoOverlayState.hidden();
+            }
+            payload.remove("overlayDateTime");
+            final String payloadSignature = payload.toString();
+            if (payloadSignature.equals(bingoBoardCachedPayload))
+            {
+                return bingoBoardState;
+            }
+            bingoBoardCachedPayload = payloadSignature;
+
             if (!jsonBoolean(payload, "active") || !jsonBoolean(payload, "matched"))
             {
                 return BingoBoardState.hidden();
@@ -3455,6 +3488,63 @@ public class ParentsGuildPlugin extends Plugin
             }
         }
         return members;
+    }
+
+    private Set<Integer> cachedBingoBoardDropTileItemIds()
+    {
+        if (!bingoBoardState.isVisible() || bingoBoardCachedPayload.isEmpty())
+        {
+            return null;
+        }
+
+        try
+        {
+            final JsonObject payload = parseResponseJson(bingoBoardCachedPayload);
+            if (!jsonBoolean(payload, "active") || !jsonBoolean(payload, "matched"))
+            {
+                return null;
+            }
+
+            final Set<Integer> itemIds = new HashSet<>();
+            final JsonObject team = jsonObject(payload, "team");
+            for (JsonElement rowElement : jsonArray(team, "grid"))
+            {
+                if (!rowElement.isJsonArray())
+                {
+                    continue;
+                }
+
+                for (JsonElement tileElement : rowElement.getAsJsonArray())
+                {
+                    if (!tileElement.isJsonObject())
+                    {
+                        continue;
+                    }
+
+                    final JsonObject tile = tileElement.getAsJsonObject();
+                    final String tileType = normalizeName(jsonString(tile, "tileType"));
+                    if (!("drop".equals(tileType) || "multi_item".equals(tileType)) || bingoDropTileIsComplete(tile))
+                    {
+                        continue;
+                    }
+
+                    final int dropItemId = jsonInt(tile, "dropItemId");
+                    if (dropItemId > 0)
+                    {
+                        itemIds.add(dropItemId);
+                    }
+                    if ("multi_item".equals(tileType))
+                    {
+                        itemIds.addAll(multiItemTileItemIds(tile));
+                    }
+                }
+            }
+            return itemIds;
+        }
+        catch (RuntimeException ex)
+        {
+            return null;
+        }
     }
 
     private static boolean multiMetricTileAcceptsScreenshotProof(JsonObject tile)
@@ -3712,7 +3802,7 @@ public class ParentsGuildPlugin extends Plugin
         }
         womExecutor.schedule(() -> {
             bingoBoardImageRefreshQueued.set(false);
-            requestBingoBoardRefresh(false);
+            updateBingoBoardPopup();
         }, 1, TimeUnit.SECONDS);
     }
 
