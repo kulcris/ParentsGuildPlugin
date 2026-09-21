@@ -249,6 +249,8 @@ public class ParentsGuildPlugin extends Plugin
     private volatile boolean clanChatRelayOutgoingActive;
     private volatile int discordChatIconId = -1;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
+    private volatile String clanPanelRevision = "";
+    private volatile String clanPanelRevisionOwner = "";
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
     private volatile BingoBoardState bingoBoardState = BingoBoardState.hidden();
     private volatile String bingoBoardCachedPayload = "";
@@ -319,6 +321,8 @@ public class ParentsGuildPlugin extends Plugin
         lastClanChatRelayOutgoingCheckAtMillis = 0L;
         clanChatRelayOutgoingActive = false;
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
+        clanPanelRevision = "";
+        clanPanelRevisionOwner = "";
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
@@ -392,6 +396,8 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayOutgoingCheckSeconds = 60;
         lastClanChatRelayOutgoingCheckAtMillis = 0L;
         clanChatRelayOutgoingActive = false;
+        clanPanelRevision = "";
+        clanPanelRevisionOwner = "";
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
@@ -506,6 +512,8 @@ public class ParentsGuildPlugin extends Plugin
                 requestWomPlayerUpdate(playerRsn);
             }
             lastLoggedInRsn = "";
+            clanPanelRevision = "";
+            clanPanelRevisionOwner = "";
             bingoOverlayState = BingoOverlayState.hidden();
             bingoBoardState = BingoBoardState.hidden();
             bingoBoardCachedPayload = "";
@@ -1014,7 +1022,7 @@ public class ParentsGuildPlugin extends Plugin
         womPanelState = currentState.withLoading(true, "Refreshing WOM events...");
         pushPanelState();
         final String playerRsn = currentLocalPlayerName();
-        womExecutor.execute(() -> refreshWomState(playerRsn, manual));
+        womExecutor.execute(() -> refreshWomState(playerRsn, manual, currentState));
     }
 
     private void rescheduleWomRefresh()
@@ -1039,12 +1047,12 @@ public class ParentsGuildPlugin extends Plugin
         );
     }
 
-    private void refreshWomState(String playerRsn, boolean manual)
+    private void refreshWomState(String playerRsn, boolean manual, WomPanelState previousState)
     {
         final long startedAtMillis = System.currentTimeMillis();
         try
         {
-            womPanelState = fetchClanPanelState(playerRsn);
+            womPanelState = fetchClanPanelState(playerRsn, previousState);
             for (CompetitionView competitionView : womPanelState.getCompetitions())
             {
                 maybeWarnCompetitionEndingSoon(competitionView, Instant.now());
@@ -2956,7 +2964,7 @@ public class ParentsGuildPlugin extends Plugin
 
     // Clan panel payload parsing
 
-    private WomPanelState fetchClanPanelState(String playerRsn) throws IOException
+    private WomPanelState fetchClanPanelState(String playerRsn, WomPanelState previousState) throws IOException
     {
         final String cleanedRsn = cleanText(playerRsn);
         if (cleanedRsn.isEmpty())
@@ -2970,11 +2978,26 @@ public class ParentsGuildPlugin extends Plugin
             return WomPanelState.message("Set the website base URL.", "The plugin loads cached clan panel data from the ParentsGuild website.");
         }
 
-        final String url = endpoint + "?playerRsn=" + URLEncoder.encode(cleanedRsn, StandardCharsets.UTF_8.toString());
+        final String normalizedRsn = normalizeName(cleanedRsn);
+        final String cachedRevision = normalizedRsn.equals(clanPanelRevisionOwner) ? clanPanelRevision : "";
+        final String url = endpoint
+            + "?playerRsn=" + URLEncoder.encode(cleanedRsn, StandardCharsets.UTF_8.toString())
+            + (cachedRevision.isEmpty() ? "" : "&panelRevision=" + URLEncoder.encode(cachedRevision, StandardCharsets.UTF_8.toString()));
         final JsonObject payload = getJsonObject(url);
         if (!jsonBoolean(payload, "matched"))
         {
             return WomPanelState.message("Clan panel unavailable.", "This account is not on the active ParentsGuild roster.");
+        }
+        if (jsonBoolean(payload, "unchanged"))
+        {
+            return previousState.withLoading(false, previousState.statusMessage);
+        }
+
+        final String receivedRevision = cleanText(jsonString(payload, "panelRevision"));
+        if (receivedRevision.matches("[a-f0-9]{40}"))
+        {
+            clanPanelRevision = receivedRevision;
+            clanPanelRevisionOwner = normalizedRsn;
         }
 
         final ClanProfileState profile = parseClanProfileState(jsonObject(payload, "profile"), cleanedRsn);
