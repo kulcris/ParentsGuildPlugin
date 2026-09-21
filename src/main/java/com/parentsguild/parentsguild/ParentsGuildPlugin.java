@@ -244,6 +244,9 @@ public class ParentsGuildPlugin extends Plugin
     private volatile boolean clanChatRelayCursorInitialized;
     private volatile String clanChatRelayClanName = "";
     private volatile int clanChatRelayPollSeconds = CLAN_CHAT_RELAY_POLL_SECONDS;
+    private volatile int clanChatRelayOutgoingCheckSeconds = 60;
+    private volatile long lastClanChatRelayOutgoingCheckAtMillis;
+    private volatile boolean clanChatRelayOutgoingActive;
     private volatile int discordChatIconId = -1;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
@@ -312,6 +315,9 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayCursor = 0L;
         clanChatRelayCursorInitialized = false;
         clanChatRelayClanName = "";
+        clanChatRelayOutgoingCheckSeconds = 60;
+        lastClanChatRelayOutgoingCheckAtMillis = 0L;
+        clanChatRelayOutgoingActive = false;
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
@@ -383,6 +389,9 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayCursor = 0L;
         clanChatRelayCursorInitialized = false;
         clanChatRelayClanName = "";
+        clanChatRelayOutgoingCheckSeconds = 60;
+        lastClanChatRelayOutgoingCheckAtMillis = 0L;
+        clanChatRelayOutgoingActive = false;
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
@@ -604,7 +613,7 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String endpoint = resolveClanChatRelayEndpoint();
-        if (endpoint.isEmpty())
+        if (endpoint.isEmpty() || !clanChatRelayOutgoingActive)
         {
             return;
         }
@@ -1257,6 +1266,8 @@ public class ParentsGuildPlugin extends Plugin
             clanChatRelayCursor = 0L;
             clanChatRelayCursorInitialized = false;
             clanChatRelayClanName = "";
+            lastClanChatRelayOutgoingCheckAtMillis = 0L;
+            clanChatRelayOutgoingActive = false;
         }
 
         if (clanChatRelayExecutor == null || resolveClanChatRelayEndpoint().isEmpty())
@@ -1285,15 +1296,30 @@ public class ParentsGuildPlugin extends Plugin
             final String endpoint = resolveClanChatRelayEndpoint();
             if (playerRsn.isEmpty() || endpoint.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
             {
+                clanChatRelayOutgoingActive = false;
                 return;
             }
 
+            final long now = System.currentTimeMillis();
+            final boolean relayClanNameKnown = !clanChatRelayClanName.isEmpty();
+            final boolean checkOutgoingRelay = !relayClanNameKnown || now - lastClanChatRelayOutgoingCheckAtMillis >= TimeUnit.SECONDS.toMillis(clanChatRelayOutgoingCheckSeconds);
+            final boolean outgoingEligible = checkOutgoingRelay && isConfiguredClanChatChannel(ChatMessageType.CLAN_CHAT);
             final String url = endpoint
                 + "?playerRsn=" + URLEncoder.encode(playerRsn, StandardCharsets.UTF_8.toString())
                 + "&after=" + clanChatRelayCursor
-                + (clanChatRelayCursorInitialized ? "" : "&skipExisting=1");
+                + (clanChatRelayCursorInitialized ? "" : "&skipExisting=1")
+                + (checkOutgoingRelay ? "&relayCheck=1&outgoingEligible=" + (outgoingEligible ? "1" : "0") : "");
             final JsonObject payload = getJsonObject(url);
             clanChatRelayClanName = normalizeName(jsonString(payload, "clanName"));
+            if (payload.has("outgoingRelayCheckSeconds"))
+            {
+                clanChatRelayOutgoingCheckSeconds = Math.max(30, Math.min(300, jsonInt(payload, "outgoingRelayCheckSeconds")));
+            }
+            if (checkOutgoingRelay)
+            {
+                lastClanChatRelayOutgoingCheckAtMillis = relayClanNameKnown ? now : 0L;
+                clanChatRelayOutgoingActive = jsonBoolean(payload, "outgoingRelayActive");
+            }
             if (payload.has("pollIntervalSeconds"))
             {
                 final int configuredPollSeconds = Math.max(5, Math.min(300, jsonInt(payload, "pollIntervalSeconds")));
@@ -1305,6 +1331,7 @@ public class ParentsGuildPlugin extends Plugin
             if (!jsonBoolean(payload, "enabled"))
             {
                 clanChatRelayCursorInitialized = false;
+                clanChatRelayOutgoingActive = false;
                 return;
             }
 
