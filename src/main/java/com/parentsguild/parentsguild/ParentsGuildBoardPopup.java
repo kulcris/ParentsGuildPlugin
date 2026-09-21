@@ -448,7 +448,10 @@ class ParentsGuildBoardPopup extends JFrame
             return cell != null
                 && cell.getTileId() != null
                 && !cell.getTileId().trim().isEmpty()
-                && ("manual".equals(tileType) || "drop".equals(tileType) || "multi_item".equals(tileType))
+                && ("manual".equals(tileType)
+                    || "drop".equals(tileType)
+                    || "multi_item".equals(tileType)
+                    || ("multi_metric".equals(tileType) && cell.isScreenshotProofEnabled()))
                 && !cell.isCompleted();
         }
 

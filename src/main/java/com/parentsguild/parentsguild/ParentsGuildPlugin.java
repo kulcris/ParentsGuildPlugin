@@ -3414,7 +3414,8 @@ public class ParentsGuildPlugin extends Plugin
                         Math.max(0, jsonInt(tile, "approvedCompletions")),
                         Math.max(0, jsonInt(tile, "pendingCompletions")),
                         parseMultiItemTileItems(tile),
-                        boardTileImage(endpoint, tile)
+                        boardTileImage(endpoint, tile),
+                        multiMetricTileAcceptsScreenshotProof(tile)
                     ));
                 }
                 if (!row.isEmpty())
@@ -3454,6 +3455,22 @@ public class ParentsGuildPlugin extends Plugin
             }
         }
         return members;
+    }
+
+    private static boolean multiMetricTileAcceptsScreenshotProof(JsonObject tile)
+    {
+        if (!"multi_metric".equals(normalizeName(jsonString(tile, "tileType"))))
+        {
+            return false;
+        }
+        for (JsonElement metricElement : jsonArray(tile, "multiMetrics"))
+        {
+            if (metricElement.isJsonObject() && jsonBoolean(metricElement.getAsJsonObject(), "screenshotProofEnabled"))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String buildBoardTooltip(JsonObject tile)
@@ -4522,6 +4539,7 @@ public class ParentsGuildPlugin extends Plugin
         int pendingCompletions;
         List<BingoBoardItem> multiItems;
         BufferedImage backgroundImage;
+        boolean screenshotProofEnabled;
     }
 
     @Value
