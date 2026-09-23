@@ -13,9 +13,13 @@ import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
 import java.time.LocalDateTime;
@@ -130,7 +134,14 @@ public class ParentsGuildPlugin extends Plugin
     private static final int LOCATION_HEARTBEAT_INTERVAL_SECONDS = 180;
     private static final int BINGO_STATUS_REFRESH_SECONDS = 60;
     private static final int CLAN_CHAT_RELAY_POLL_SECONDS = 10;
-    private static final int[] LOGIN_SYNC_DELAYS_SECONDS = {1, 3, 6};
+    private static final int PLUGIN_SYNC_PROTOCOL_VERSION = 2;
+    private static final int PLUGIN_SYNC_ACTIVE_SECONDS = 60;
+    private static final int PLUGIN_SYNC_PANEL_SECONDS = 300;
+    private static final int PLUGIN_SYNC_IDLE_SECONDS = 900;
+    private static final long PLUGIN_SYNC_RETRY_MAX_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    private static final long XP_METRIC_BATCH_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    private static final String XP_BATCHES_CONFIG_KEY = "pendingXpMetricBatchesV2";
+    private static final long PLUGIN_IMAGE_CACHE_MAX_BYTES = 50L * 1024L * 1024L;
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
         InventoryID.TRAWLER_REWARDINV, "Reward chest: Fishing trawler reward",
         InventoryID.TRAIL_REWARDINV, "Reward chest: Barrows reward",
@@ -210,11 +221,14 @@ public class ParentsGuildPlugin extends Plugin
     private final Map<String, Long> seenSubmissionNotificationIds = new ConcurrentHashMap<>();
     private final Map<String, Long> seenCompletionNotificationIds = new ConcurrentHashMap<>();
     private final Map<String, BufferedImage> bingoBoardImageCache = new ConcurrentHashMap<>();
+    private final Set<String> queuedBoardImageUrls = ConcurrentHashMap.newKeySet();
     private final Map<Integer, Long> completedDropItemDenyCache = new ConcurrentHashMap<>();
     private final Map<Integer, Map<Integer, Integer>> rewardContainerSnapshots = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> inventorySnapshot = new LinkedHashMap<>();
     private final Map<Integer, Long> womWarningMarkers = new ConcurrentHashMap<>();
     private final Map<String, Long> metricLocalGains = new ConcurrentHashMap<>();
+    private final Map<String, PendingXpMetricBatch> pendingXpMetricBatches = new ConcurrentHashMap<>();
+    private final Map<String, String> pendingXpBatchByMetric = new ConcurrentHashMap<>();
     private final Map<String, Integer> lastSkillXpByMetricKey = new ConcurrentHashMap<>();
     private final Map<String, Integer> lastAbsoluteMetricCountByKey = new ConcurrentHashMap<>();
     private final Map<String, Integer> clanChatRankIconIds = new ConcurrentHashMap<>();
@@ -226,6 +240,7 @@ public class ParentsGuildPlugin extends Plugin
     private final AtomicBoolean bingoBoardImageRefreshQueued = new AtomicBoolean(false);
     private final AtomicBoolean locationHeartbeatInFlight = new AtomicBoolean(false);
     private final AtomicBoolean clanChatRelayPollInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean pluginSyncInFlight = new AtomicBoolean(false);
     private volatile long lastConfigWarningAtMillis = 0L;
     private volatile long dropTileEligibilityCacheAtMillis = 0L;
     private volatile Set<Integer> dropTileEligibilityCache = new HashSet<>();
@@ -247,10 +262,18 @@ public class ParentsGuildPlugin extends Plugin
     private volatile int clanChatRelayOutgoingCheckSeconds = 60;
     private volatile long lastClanChatRelayOutgoingCheckAtMillis;
     private volatile boolean clanChatRelayOutgoingActive;
+    private volatile PluginSyncMode pluginSyncMode = PluginSyncMode.UNKNOWN;
+    private volatile int pluginSyncFailureCount;
+    private volatile String bingoBoardRevision = "";
+    private volatile String bingoNotificationRevision = "";
+    private volatile String pluginSyncSettingsRevision = "";
+    private volatile boolean writingPendingXpMetricBatches;
     private volatile int discordChatIconId = -1;
     private volatile WomPanelState womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
     private volatile String clanPanelRevision = "";
     private volatile String clanPanelRevisionOwner = "";
+    private volatile int clanPanelRefreshSeconds;
+    private volatile boolean bingoMembershipResolved;
     private volatile BingoOverlayState bingoOverlayState = BingoOverlayState.hidden();
     private volatile BingoBoardState bingoBoardState = BingoBoardState.hidden();
     private volatile String bingoBoardCachedPayload = "";
@@ -263,6 +286,7 @@ public class ParentsGuildPlugin extends Plugin
     private ScheduledFuture<?> locationHeartbeatTask;
     private ScheduledFuture<?> locationSettingsTask;
     private ScheduledFuture<?> clanChatRelayTask;
+    private ScheduledFuture<?> pluginSyncTask;
     private ParentsGuildPanel womPanel;
     private NavigationButton womNavigationButton;
     private ParentsGuildBingoOverlay bingoOverlay;
@@ -283,6 +307,7 @@ public class ParentsGuildPlugin extends Plugin
         seenSubmissionNotificationIds.clear();
         seenCompletionNotificationIds.clear();
         bingoBoardImageCache.clear();
+        queuedBoardImageUrls.clear();
         completedDropItemDenyCache.clear();
         rewardContainerSnapshots.clear();
         inventorySnapshot.clear();
@@ -295,6 +320,8 @@ public class ParentsGuildPlugin extends Plugin
         inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
+        pendingXpMetricBatches.clear();
+        pendingXpBatchByMetric.clear();
         metricWomUpdateReminderTileIds.clear();
         lastSkillXpByMetricKey.clear();
         lastAbsoluteMetricCountByKey.clear();
@@ -320,9 +347,18 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayOutgoingCheckSeconds = 60;
         lastClanChatRelayOutgoingCheckAtMillis = 0L;
         clanChatRelayOutgoingActive = false;
+        pluginSyncMode = PluginSyncMode.UNKNOWN;
+        pluginSyncFailureCount = 0;
+        bingoBoardRevision = "";
+        bingoNotificationRevision = "";
+        pluginSyncSettingsRevision = "";
+        writingPendingXpMetricBatches = false;
+        pluginSyncInFlight.set(false);
         womPanelState = WomPanelState.message("Loading WOM events...", "Waiting for first refresh.");
         clanPanelRevision = "";
         clanPanelRevisionOwner = "";
+        clanPanelRefreshSeconds = 0;
+        bingoMembershipResolved = false;
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
@@ -337,33 +373,33 @@ public class ParentsGuildPlugin extends Plugin
             thread.setDaemon(true);
             return thread;
         });
+        loadPendingXpMetricBatches();
         womPanel = new ParentsGuildPanel(this);
         womNavigationButton = buildNavigationButton();
         clientToolbar.addNavigation(womNavigationButton);
         bingoOverlay = new ParentsGuildBingoOverlay(this);
         overlayManager.add(bingoOverlay);
         pushPanelState();
-        rescheduleWomRefresh();
-        rescheduleBingoStatusRefresh();
-        rescheduleBingoBoardRefresh();
-        rescheduleLocationHeartbeat();
-        rescheduleLocationSettingsRefresh();
-        rescheduleClanChatRelay();
-        requestPluginLocationSettings();
-        requestWomRefresh(true);
         if (client.getGameState() == GameState.LOGGED_IN)
         {
+            lastLoggedInRsn = currentLocalPlayerName();
+            restorePendingXpLocalGainsForPlayer(lastLoggedInRsn);
             requestLoginInitialSync();
-            womExecutor.schedule(this::requestLocationHeartbeat, 3, TimeUnit.SECONDS);
+        }
+        else
+        {
+            schedulePluginSyncAfter(PLUGIN_SYNC_IDLE_SECONDS);
         }
     }
 
     @Override
     protected void shutDown()
     {
+        persistPendingXpMetricBatches();
         recentDropEventIds.clear();
         seenSubmissionNotificationIds.clear();
         seenCompletionNotificationIds.clear();
+        queuedBoardImageUrls.clear();
         rewardContainerSnapshots.clear();
         inventorySnapshot.clear();
         pendingNpcInventoryRewardInteraction = null;
@@ -375,6 +411,8 @@ public class ParentsGuildPlugin extends Plugin
         inventorySnapshotInitialized = false;
         womWarningMarkers.clear();
         metricLocalGains.clear();
+        pendingXpMetricBatches.clear();
+        pendingXpBatchByMetric.clear();
         metricWomUpdateReminderTileIds.clear();
         lastSkillXpByMetricKey.clear();
         lastAbsoluteMetricCountByKey.clear();
@@ -385,6 +423,7 @@ public class ParentsGuildPlugin extends Plugin
         bingoBoardImageRefreshQueued.set(false);
         locationHeartbeatInFlight.set(false);
         clanChatRelayPollInFlight.set(false);
+        pluginSyncInFlight.set(false);
         clanChatRankIconIds.clear();
         recentInjectedDiscordMessages.clear();
         discordChatIconId = -1;
@@ -398,10 +437,22 @@ public class ParentsGuildPlugin extends Plugin
         clanChatRelayOutgoingActive = false;
         clanPanelRevision = "";
         clanPanelRevisionOwner = "";
+        clanPanelRefreshSeconds = 0;
+        bingoMembershipResolved = false;
         bingoOverlayState = BingoOverlayState.hidden();
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
         bingoBoardOverlayEnabled = false;
+        pluginSyncMode = PluginSyncMode.UNKNOWN;
+        pluginSyncFailureCount = 0;
+        bingoBoardRevision = "";
+        bingoNotificationRevision = "";
+        pluginSyncSettingsRevision = "";
+        if (pluginSyncTask != null)
+        {
+            pluginSyncTask.cancel(true);
+            pluginSyncTask = null;
+        }
         if (womRefreshTask != null)
         {
             womRefreshTask.cancel(true);
@@ -465,22 +516,19 @@ public class ParentsGuildPlugin extends Plugin
     @Subscribe
     public void onConfigChanged(ConfigChanged event)
     {
-        if (!"parentsguild".equals(event.getGroup()))
+        if (!"parentsguild".equals(event.getGroup()) || XP_BATCHES_CONFIG_KEY.equals(event.getKey()))
         {
             return;
         }
 
-        rescheduleWomRefresh();
-        rescheduleBingoStatusRefresh();
-        rescheduleBingoBoardRefresh();
-        rescheduleLocationHeartbeat();
-        rescheduleLocationSettingsRefresh();
-        rescheduleClanChatRelay();
-        requestPluginLocationSettings();
-        requestLocationHeartbeat();
-        requestWomRefresh(true);
-        requestBingoStatusRefresh(true);
-        requestBingoBoardRefresh(true);
+        if (pluginSyncMode == PluginSyncMode.LEGACY)
+        {
+            startLegacyPolling();
+            requestWomRefresh(true);
+            requestBingoStatusRefresh(true);
+            return;
+        }
+        requestPluginSync(true);
     }
 
     @Subscribe
@@ -488,12 +536,9 @@ public class ParentsGuildPlugin extends Plugin
     {
         if (event.getGameState() == GameState.LOGGED_IN)
         {
-            requestLoginInitialSync();
             lastLoggedInRsn = currentLocalPlayerName();
-            if (womExecutor != null)
-            {
-                womExecutor.schedule(this::requestLocationHeartbeat, 3, TimeUnit.SECONDS);
-            }
+            restorePendingXpLocalGainsForPlayer(lastLoggedInRsn);
+            requestLoginInitialSync();
             return;
         }
 
@@ -506,6 +551,10 @@ public class ParentsGuildPlugin extends Plugin
             recoveryInterfaceOpen = false;
             storageInterfaceOpen = false;
             inventorySnapshotInitialized = false;
+            metricLocalGains.clear();
+            lastSkillXpByMetricKey.clear();
+            lastAbsoluteMetricCountByKey.clear();
+            metricWomUpdateReminderTileIds.clear();
             final String playerRsn = cleanText(lastLoggedInRsn);
             if (!playerRsn.isEmpty() && config.submitWomRefreshOnLogout())
             {
@@ -514,6 +563,8 @@ public class ParentsGuildPlugin extends Plugin
             lastLoggedInRsn = "";
             clanPanelRevision = "";
             clanPanelRevisionOwner = "";
+            clanPanelRefreshSeconds = 0;
+            bingoMembershipResolved = false;
             bingoOverlayState = BingoOverlayState.hidden();
             bingoBoardState = BingoBoardState.hidden();
             bingoBoardCachedPayload = "";
@@ -555,8 +606,10 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final long gained = currentXp - previousXp;
-        applyMetricDelta(skillMetricKey, gained, event.getSkill().getName() + " XP");
-        applyMetricDelta("computed:overall_xp", gained, "Overall XP");
+        // XP changes are frequent. Queue the cumulative checkpoint so the next
+        // unified poll can submit one idempotent update per metric tile.
+        queueXpMetricDelta(skillMetricKey, gained, event.getSkill().getName() + " XP");
+        queueXpMetricDelta("computed:overall_xp", gained, "Overall XP");
     }
 
     private void handleMetricChatMessage(ChatMessage event)
@@ -735,6 +788,243 @@ public class ParentsGuildPlugin extends Plugin
             submitMetricClaim(endpoint, playerRsn, cell, pluginProgress, gained, sourceLabel);
             maybeRemindWomUpdateRequired(cell, pluginProgress);
         }
+    }
+
+    private synchronized void queueXpMetricDelta(String metricKey, long gained, String sourceLabel)
+    {
+        if (gained <= 0L)
+        {
+            return;
+        }
+
+        final String playerRsn = currentLocalPlayerName();
+        if (playerRsn.isEmpty())
+        {
+            return;
+        }
+
+        final List<BingoBoardCell> matchingTiles = activeMetricTiles(metricKey);
+        if (matchingTiles.isEmpty())
+        {
+            return;
+        }
+
+        final long now = System.currentTimeMillis();
+        for (BingoBoardCell cell : matchingTiles)
+        {
+            final String tileId = cleanText(cell.getTileId());
+            final String cleanedMetricKey = cleanText(cell.getMetricKey());
+            if (tileId.isEmpty() || cleanedMetricKey.isEmpty() || cell.isCompleted() || cell.getTargetValue() <= 0L)
+            {
+                continue;
+            }
+
+            final long localGain = metricLocalGains.merge(tileId, gained, Long::sum);
+            final long pluginProgress = cell.getRequiredCompletions() > 1
+                ? localGain
+                : Math.max(0L, cell.getProgressValue()) + localGain;
+            final String metricBatchKey = xpMetricBatchKey(playerRsn, tileId, cleanedMetricKey, cell.getTargetValue());
+            final String existingEventId = pendingXpBatchByMetric.get(metricBatchKey);
+            final PendingXpMetricBatch existing = existingEventId == null ? null : pendingXpMetricBatches.get(existingEventId);
+
+            if (existing != null && !existing.inFlight)
+            {
+                existing.gainedValue = localGain;
+                existing.pluginProgressValue = pluginProgress;
+                existing.metricLabel = firstNonBlank(cell.getMetricLabel(), cell.getLabel(), sourceLabel);
+            }
+            else
+            {
+                final PendingXpMetricBatch batch = new PendingXpMetricBatch();
+                batch.eventId = UUID.randomUUID().toString();
+                batch.metricBatchKey = metricBatchKey;
+                batch.playerRsn = playerRsn;
+                batch.tileId = tileId;
+                batch.metricKey = cleanedMetricKey;
+                batch.metricLabel = firstNonBlank(cell.getMetricLabel(), cell.getLabel(), sourceLabel);
+                batch.gainedValue = localGain;
+                batch.pluginProgressValue = pluginProgress;
+                batch.targetValue = cell.getTargetValue();
+                batch.capturedAtUtc = CAPTURED_AT_FORMAT.format(Instant.now().truncatedTo(ChronoUnit.SECONDS));
+                batch.createdAtMillis = now;
+                batch.dueAtMillis = now + XP_METRIC_BATCH_MILLIS;
+                pendingXpMetricBatches.put(batch.eventId, batch);
+                pendingXpBatchByMetric.put(metricBatchKey, batch.eventId);
+            }
+            maybeRemindWomUpdateRequired(cell, pluginProgress);
+        }
+        persistPendingXpMetricBatches();
+    }
+
+    private synchronized JsonArray dueXpMetricBatches(String playerRsn, long now)
+    {
+        final JsonArray batches = new JsonArray();
+        final List<PendingXpMetricBatch> pending = new ArrayList<>(pendingXpMetricBatches.values());
+        pending.sort((left, right) -> Long.compare(left.createdAtMillis, right.createdAtMillis));
+        for (PendingXpMetricBatch batch : pending)
+        {
+            if (batches.size() >= 50 || batch == null || batch.dueAtMillis > now || !sameNormalizedName(batch.playerRsn, playerRsn))
+            {
+                continue;
+            }
+
+            batch.inFlight = true;
+            final JsonObject payload = new JsonObject();
+            payload.addProperty("eventId", batch.eventId);
+            payload.addProperty("tileId", batch.tileId);
+            payload.addProperty("metricKey", batch.metricKey);
+            payload.addProperty("metricLabel", batch.metricLabel);
+            payload.addProperty("gainedValue", batch.gainedValue);
+            payload.addProperty("pluginProgressValue", batch.pluginProgressValue);
+            payload.addProperty("targetValue", batch.targetValue);
+            payload.addProperty("capturedAtUtc", batch.capturedAtUtc);
+            batches.add(payload);
+        }
+        if (batches.size() > 0)
+        {
+            persistPendingXpMetricBatches();
+        }
+        return batches;
+    }
+
+    private synchronized void applyXpMetricBatchResults(JsonArray results)
+    {
+        boolean changed = false;
+        for (JsonElement element : results)
+        {
+            if (!element.isJsonObject())
+            {
+                continue;
+            }
+
+            final JsonObject result = element.getAsJsonObject();
+            final String eventId = cleanText(jsonString(result, "eventId"));
+            final PendingXpMetricBatch batch = eventId.isEmpty() ? null : pendingXpMetricBatches.get(eventId);
+            if (batch == null)
+            {
+                continue;
+            }
+
+            if (jsonBoolean(result, "accepted") || !jsonBoolean(result, "retry"))
+            {
+                pendingXpMetricBatches.remove(eventId);
+                pendingXpBatchByMetric.remove(batch.metricBatchKey, eventId);
+            }
+            else
+            {
+                batch.inFlight = false;
+            }
+            changed = true;
+        }
+        if (changed)
+        {
+            persistPendingXpMetricBatches();
+        }
+    }
+
+    private synchronized void loadPendingXpMetricBatches()
+    {
+        if (configManager == null)
+        {
+            return;
+        }
+
+        final String stored = configManager.getConfiguration("parentsguild", XP_BATCHES_CONFIG_KEY);
+        if (stored == null || stored.trim().isEmpty())
+        {
+            return;
+        }
+
+        try
+        {
+            final JsonElement parsed = gson.fromJson(stored, JsonElement.class);
+            if (parsed == null || !parsed.isJsonArray())
+            {
+                return;
+            }
+
+            for (JsonElement element : parsed.getAsJsonArray())
+            {
+                if (!element.isJsonObject())
+                {
+                    continue;
+                }
+
+                final PendingXpMetricBatch batch = gson.fromJson(element, PendingXpMetricBatch.class);
+                if (!isValidPendingXpMetricBatch(batch))
+                {
+                    continue;
+                }
+
+                batch.inFlight = false;
+                pendingXpMetricBatches.put(batch.eventId, batch);
+                final String currentEventId = pendingXpBatchByMetric.get(batch.metricBatchKey);
+                final PendingXpMetricBatch current = currentEventId == null ? null : pendingXpMetricBatches.get(currentEventId);
+                if (current == null || batch.createdAtMillis >= current.createdAtMillis)
+                {
+                    pendingXpBatchByMetric.put(batch.metricBatchKey, batch.eventId);
+                }
+            }
+        }
+        catch (RuntimeException ex)
+        {
+            log.warn("Discarding unreadable pending ParentsGuild XP metric batches", ex);
+            pendingXpMetricBatches.clear();
+            pendingXpBatchByMetric.clear();
+        }
+    }
+
+    private synchronized void restorePendingXpLocalGainsForPlayer(String playerRsn)
+    {
+        metricLocalGains.clear();
+        final String normalizedPlayerRsn = normalizeName(playerRsn);
+        if (normalizedPlayerRsn.isEmpty())
+        {
+            return;
+        }
+        for (PendingXpMetricBatch batch : pendingXpMetricBatches.values())
+        {
+            if (batch != null && normalizedPlayerRsn.equals(normalizeName(batch.playerRsn)))
+            {
+                metricLocalGains.merge(batch.tileId, batch.gainedValue, (existing, value) -> Math.max(existing, value));
+            }
+        }
+    }
+
+    private synchronized void persistPendingXpMetricBatches()
+    {
+        if (configManager == null || writingPendingXpMetricBatches)
+        {
+            return;
+        }
+
+        writingPendingXpMetricBatches = true;
+        try
+        {
+            configManager.setConfiguration("parentsguild", XP_BATCHES_CONFIG_KEY, gson.toJson(new ArrayList<>(pendingXpMetricBatches.values())));
+        }
+        finally
+        {
+            writingPendingXpMetricBatches = false;
+        }
+    }
+
+    private static boolean isValidPendingXpMetricBatch(PendingXpMetricBatch batch)
+    {
+        return batch != null
+            && cleanText(batch.eventId).matches("[A-Za-z0-9-]{8,64}")
+            && !cleanText(batch.metricBatchKey).isEmpty()
+            && !cleanText(batch.playerRsn).isEmpty()
+            && !cleanText(batch.tileId).isEmpty()
+            && !cleanText(batch.metricKey).isEmpty()
+            && batch.gainedValue > 0L
+            && batch.targetValue > 0L
+            && !cleanText(batch.capturedAtUtc).isEmpty();
+    }
+
+    private static String xpMetricBatchKey(String playerRsn, String tileId, String metricKey, long targetValue)
+    {
+        return normalizeName(playerRsn) + "|" + cleanText(tileId) + "|" + cleanText(metricKey) + "|" + targetValue;
     }
 
     private void maybeRemindWomUpdateRequired(BingoBoardCell cell, long pluginProgress)
@@ -955,23 +1245,6 @@ public class ParentsGuildPlugin extends Plugin
     private void requestLoginInitialSync()
     {
         requestLoginSyncAttempt();
-
-        if (womExecutor == null || (!config.showBingoOverlay() && !config.enableBingoDrops() && !config.enableBingoMetricTracking()))
-        {
-            return;
-        }
-
-        for (int delaySeconds : LOGIN_SYNC_DELAYS_SECONDS)
-        {
-            womExecutor.schedule(() -> {
-                if (client.getGameState() != GameState.LOGGED_IN)
-                {
-                    return;
-                }
-
-                requestLoginSyncAttempt();
-            }, delaySeconds, TimeUnit.SECONDS);
-        }
     }
 
     private void requestLoginSyncAttempt()
@@ -980,18 +1253,389 @@ public class ParentsGuildPlugin extends Plugin
         if (playerName.isEmpty())
         {
             debugLog("Skipping login sync attempt because local player name is not available yet.");
+            schedulePluginSyncAfter(5L);
             return;
         }
         lastLoggedInRsn = playerName;
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            requestPluginSync(true);
+            return;
+        }
         requestWomRefresh(true);
         requestBingoStatusRefresh(true);
         requestBingoBoardRefresh(true);
+    }
+
+    private void startLegacyPolling()
+    {
+        if (pluginSyncTask != null)
+        {
+            pluginSyncTask.cancel(false);
+            pluginSyncTask = null;
+        }
+        rescheduleWomRefresh();
+        rescheduleBingoStatusRefresh();
+        rescheduleBingoBoardRefresh();
+        rescheduleLocationHeartbeat();
+        rescheduleLocationSettingsRefresh();
+        rescheduleClanChatRelay();
+        requestPluginLocationSettings();
+    }
+
+    private void schedulePluginSyncAfter(long delaySeconds)
+    {
+        if (pluginSyncMode == PluginSyncMode.LEGACY || womExecutor == null)
+        {
+            return;
+        }
+        if (pluginSyncTask != null)
+        {
+            pluginSyncTask.cancel(false);
+            pluginSyncTask = null;
+        }
+        final long boundedSeconds = Math.max(1L, Math.min(PLUGIN_SYNC_IDLE_SECONDS, delaySeconds));
+        pluginSyncTask = womExecutor.schedule(() -> requestPluginSync(false), boundedSeconds, TimeUnit.SECONDS);
+    }
+
+    private void requestPluginSync(boolean manual)
+    {
+        if (pluginSyncMode == PluginSyncMode.LEGACY)
+        {
+            return;
+        }
+        if (womExecutor == null || resolvePluginSyncEndpoint().isEmpty())
+        {
+            return;
+        }
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            schedulePluginSyncAfter(PLUGIN_SYNC_IDLE_SECONDS);
+            return;
+        }
+        if (!pluginSyncInFlight.compareAndSet(false, true))
+        {
+            return;
+        }
+
+        clientThread.invoke(() -> {
+            final String playerRsn = currentLocalPlayerName();
+            if (playerRsn.isEmpty() || womExecutor == null)
+            {
+                pluginSyncInFlight.set(false);
+                schedulePluginSyncAfter(PLUGIN_SYNC_ACTIVE_SECONDS);
+                return;
+            }
+
+            final JsonObject requestPayload = buildPluginSyncRequest(playerRsn);
+            womExecutor.execute(() -> performPluginSync(resolvePluginSyncEndpoint(), requestPayload, manual));
+        });
+    }
+
+    private JsonObject buildPluginSyncRequest(String playerRsn)
+    {
+        final JsonObject payload = new JsonObject();
+        payload.addProperty("protocolVersion", PLUGIN_SYNC_PROTOCOL_VERSION);
+        payload.addProperty("playerRsn", playerRsn);
+        payload.addProperty("panelRevision", normalizeName(playerRsn).equals(clanPanelRevisionOwner) ? clanPanelRevision : "");
+        payload.addProperty("bingoRevision", bingoBoardRevision);
+        payload.addProperty("bingoNotificationRevision", bingoNotificationRevision);
+        payload.addProperty("settingsRevision", pluginSyncSettingsRevision);
+        payload.addProperty("chatCursor", clanChatRelayCursor);
+        payload.addProperty("chatCursorInitialized", clanChatRelayCursorInitialized);
+
+        final boolean bingoEnabled = config.showBingoOverlay() || config.enableBingoDrops() || config.enableBingoMetricTracking() || bingoBoardOverlayEnabled;
+        final boolean configuredClanChatActive = isConfiguredClanChatChannel(ChatMessageType.CLAN_CHAT);
+        // The first sync learns the configured clan name. It never requests a
+        // relay lease until the local channel has been verified against it.
+        final boolean chatEnabled = configuredClanChatActive
+            || (clanChatRelayClanName.isEmpty() && client.getClanChannel() != null);
+        final long now = System.currentTimeMillis();
+        final boolean relayCheck = configuredClanChatActive
+            && now - lastClanChatRelayOutgoingCheckAtMillis >= TimeUnit.SECONDS.toMillis(clanChatRelayOutgoingCheckSeconds);
+        final JsonObject features = new JsonObject();
+        features.addProperty("panel", config.enableWomEventTracking() || bingoEnabled);
+        features.addProperty("bingo", bingoEnabled);
+        // Drop eligibility is derived from this cached board so drop captures do
+        // not need a second request immediately after a loot event.
+        features.addProperty("bingoBoard", bingoBoardOverlayEnabled || config.showBingoOverlay() || config.enableBingoMetricTracking() || config.enableBingoDrops());
+        features.addProperty("chat", chatEnabled);
+        payload.add("features", features);
+        payload.addProperty("relayCheck", relayCheck);
+        payload.addProperty("outgoingEligible", relayCheck && configuredClanChatActive);
+
+        final JsonObject location = buildDueLocationHeartbeatPayload(playerRsn, now);
+        if (location != null)
+        {
+            payload.add("location", location);
+        }
+
+        final JsonArray metricBatches = dueXpMetricBatches(playerRsn, now);
+        if (metricBatches.size() > 0)
+        {
+            payload.add("metricBatches", metricBatches);
+        }
+        return payload;
+    }
+
+    private void performPluginSync(String endpoint, JsonObject requestPayload, boolean manual)
+    {
+        try
+        {
+            final Request request = new Request.Builder()
+                .url(endpoint)
+                .header("Accept", "application/json")
+                .post(RequestBody.create(JSON, gson.toJson(requestPayload)))
+                .build();
+            try (Response response = okHttpClient.newCall(request).execute())
+            {
+                final String responseBody = response.body() != null ? response.body().string() : "";
+                if (response.code() == 404 || response.code() == 405)
+                {
+                    pluginSyncMode = PluginSyncMode.LEGACY;
+                    startLegacyPolling();
+                    requestWomRefresh(true);
+                    return;
+                }
+                if (!response.isSuccessful())
+                {
+                    if (response.code() == 401 || response.code() == 403)
+                    {
+                        pluginSyncFailureCount = 0;
+                        schedulePluginSyncAfter(PLUGIN_SYNC_IDLE_SECONDS);
+                        return;
+                    }
+                    throw new IOException("HTTP " + response.code() + " for plugin sync: " + responseBody);
+                }
+
+                final JsonObject payload = parseResponseJson(responseBody);
+                if (jsonInt(payload, "protocolVersion") < PLUGIN_SYNC_PROTOCOL_VERSION)
+                {
+                    pluginSyncMode = PluginSyncMode.LEGACY;
+                    startLegacyPolling();
+                    requestWomRefresh(true);
+                    return;
+                }
+
+                pluginSyncMode = PluginSyncMode.UNIFIED;
+                pluginSyncFailureCount = 0;
+                applyUnifiedPluginSyncPayload(payload, cleanText(jsonString(requestPayload, "playerRsn")));
+                final int nextSyncSeconds = Math.max(PLUGIN_SYNC_ACTIVE_SECONDS, Math.min(PLUGIN_SYNC_IDLE_SECONDS, jsonInt(payload, "nextSyncSeconds")));
+                schedulePluginSyncAfter(nextSyncSeconds > 0 ? nextSyncSeconds : PLUGIN_SYNC_PANEL_SECONDS);
+            }
+        }
+        catch (Exception ex)
+        {
+            pluginSyncFailureCount++;
+            final long retryMillis = Math.min(
+                PLUGIN_SYNC_RETRY_MAX_MILLIS,
+                TimeUnit.SECONDS.toMillis(15L * (1L << Math.min(4, Math.max(0, pluginSyncFailureCount - 1))))
+            );
+            if (config.debug() || manual)
+            {
+                log.warn("ParentsGuild unified sync failed", ex);
+            }
+            schedulePluginSyncAfter(Math.max(1L, TimeUnit.MILLISECONDS.toSeconds(retryMillis)));
+        }
+        finally
+        {
+            pluginSyncInFlight.set(false);
+        }
+    }
+
+    private void applyUnifiedPluginSyncPayload(JsonObject payload, String playerRsn)
+    {
+        applyUnifiedPluginSyncSettings(jsonObject(payload, "settings"));
+        applyUnifiedClanPanelPayload(jsonObject(payload, "panel"), playerRsn);
+
+        if (payload.has("bingo") && payload.get("bingo").isJsonObject())
+        {
+            final BingoBoardState nextBoardState = parseBingoBoardPayload(
+                payload.getAsJsonObject("bingo"),
+                playerRsn,
+                resolveBingoBoardEndpoint()
+            );
+            if (nextBoardState != bingoBoardState)
+            {
+                bingoBoardState = nextBoardState;
+                updateBingoBoardPopup();
+            }
+        }
+        else if (bingoMembershipResolved && !isMatchedActiveBingoMember())
+        {
+            hideBingoBoardState();
+        }
+
+        if (payload.has("chat") && payload.get("chat").isJsonObject())
+        {
+            applyUnifiedClanChatPayload(payload.getAsJsonObject("chat"));
+        }
+        if (payload.has("location") && payload.get("location").isJsonObject()
+            && "updated".equals(jsonString(payload.getAsJsonObject("location"), "outcome")))
+        {
+            lastLocationHeartbeatAtMillis = System.currentTimeMillis();
+        }
+        applyXpMetricBatchResults(jsonArray(payload, "metricResults"));
+
+        for (CompetitionView competitionView : womPanelState.getCompetitions())
+        {
+            maybeWarnCompetitionEndingSoon(competitionView, Instant.now());
+        }
+        pushPanelState();
+    }
+
+    private void applyUnifiedPluginSyncSettings(JsonObject settings)
+    {
+        final String revision = cleanText(jsonString(settings, "revision"));
+        if (revision.matches("[a-f0-9]{40}"))
+        {
+            pluginSyncSettingsRevision = revision;
+        }
+        if (jsonBoolean(settings, "unchanged"))
+        {
+            return;
+        }
+
+        final int configuredLocationInterval = jsonInt(settings, "locationHeartbeatSeconds");
+        if (configuredLocationInterval > 0)
+        {
+            locationHeartbeatIntervalSeconds = Math.max(60, Math.min(900, configuredLocationInterval));
+        }
+        final int configuredPanelInterval = jsonInt(settings, "panelRefreshSeconds");
+        if (configuredPanelInterval > 0)
+        {
+            clanPanelRefreshSeconds = Math.max(30, Math.min(3600, configuredPanelInterval));
+        }
+    }
+
+    private void applyUnifiedClanPanelPayload(JsonObject payload, String playerRsn)
+    {
+        final String normalizedRsn = normalizeName(playerRsn);
+        final String revision = firstNonBlank(jsonString(payload, "revision"), jsonString(payload, "panelRevision"));
+        if (revision.matches("[a-f0-9]{40}"))
+        {
+            clanPanelRevision = revision;
+            clanPanelRevisionOwner = normalizedRsn;
+        }
+        if (jsonBoolean(payload, "unchanged"))
+        {
+            bingoMembershipResolved = true;
+            return;
+        }
+        if (!jsonBoolean(payload, "matched"))
+        {
+            womPanelState = WomPanelState.message("Clan panel unavailable.", "This account is not on the active ParentsGuild roster.");
+            bingoMembershipResolved = true;
+            hideBingoBoardState();
+            return;
+        }
+
+        applyClanPanelRefreshInterval(payload);
+        final ClanProfileState profile = parseClanProfileState(jsonObject(payload, "profile"), playerRsn);
+        final BingoPanelState bingo = parseBingoPanelState(jsonObject(payload, "bingo"));
+        final WomEventsPayload womEvents = parseWomEventsPayload(jsonObject(payload, "womEvents"));
+        final AnnouncementState announcement = parseAnnouncementState(jsonObject(payload, "announcements"));
+        final QuickLinksState quickLinks = parseQuickLinksState(jsonObject(payload, "quickLinks"));
+        final List<UpcomingEventState> upcomingEvents = parseUpcomingEvents(jsonArray(payload, "upcomingEvents"));
+        final List<CompetitionView> competitions = womEvents.getCompetitions();
+        final String statusMessage = competitions.isEmpty()
+            ? "No active WOM events."
+            : competitions.size() + " active WOM event" + (competitions.size() == 1 ? "" : "s") + ".";
+        final String detail = womEvents.getDetailMessage().isEmpty()
+            ? "Last updated " + formatDisplayDateTime(Instant.now())
+            : womEvents.getDetailMessage();
+
+        womPanelState = new WomPanelState(false, statusMessage, detail, profile, bingo, announcement, quickLinks, upcomingEvents, competitions);
+        bingoMembershipResolved = true;
+    }
+
+    private void applyUnifiedClanChatPayload(JsonObject payload)
+    {
+        final long now = System.currentTimeMillis();
+        clanChatRelayClanName = normalizeName(jsonString(payload, "clanName"));
+        if (payload.has("outgoingRelayCheckSeconds"))
+        {
+            clanChatRelayOutgoingCheckSeconds = Math.max(30, Math.min(300, jsonInt(payload, "outgoingRelayCheckSeconds")));
+        }
+        if (payload.has("outgoingRelayActive"))
+        {
+            lastClanChatRelayOutgoingCheckAtMillis = now;
+            clanChatRelayOutgoingActive = jsonBoolean(payload, "outgoingRelayActive");
+        }
+
+        if (!jsonBoolean(payload, "enabled"))
+        {
+            clanChatRelayCursorInitialized = false;
+            clanChatRelayOutgoingActive = false;
+            return;
+        }
+
+        final long nextCursor = Math.max(clanChatRelayCursor, jsonLong(payload, "cursor"));
+        if (!clanChatRelayCursorInitialized)
+        {
+            clanChatRelayCursor = nextCursor;
+            clanChatRelayCursorInitialized = true;
+            return;
+        }
+
+        for (JsonElement element : jsonArray(payload, "messages"))
+        {
+            if (!element.isJsonObject())
+            {
+                continue;
+            }
+            final JsonObject message = element.getAsJsonObject();
+            final String senderName = cleanText(jsonString(message, "senderName"));
+            final String rankName = cleanText(jsonString(message, "rankName"));
+            final String text = cleanText(jsonString(message, "message"));
+            if (!senderName.isEmpty() && !text.isEmpty())
+            {
+                displayDiscordClanChatMessage(senderName, rankName, text);
+            }
+        }
+        clanChatRelayCursor = nextCursor;
+    }
+
+    private boolean queueBingoActionBoardPatch(JsonObject response, String playerRsn)
+    {
+        if (response == null || !response.has("board") || !response.get("board").isJsonObject())
+        {
+            return false;
+        }
+
+        if (womExecutor == null)
+        {
+            return false;
+        }
+        final JsonObject boardPatch = parseResponseJson(response.get("board").toString());
+        womExecutor.execute(() -> applyBingoActionBoardPatch(boardPatch, playerRsn));
+        return true;
+    }
+
+    private void applyBingoActionBoardPatch(JsonObject boardPatch, String playerRsn)
+    {
+        final BingoBoardState nextBoardState = parseBingoBoardPayload(
+            boardPatch,
+            playerRsn,
+            resolveBingoBoardEndpoint()
+        );
+        if (nextBoardState != bingoBoardState)
+        {
+            bingoBoardState = nextBoardState;
+            updateBingoBoardPopup();
+        }
+        pushPanelState();
     }
 
     // WOM and clan panel refresh
 
     void requestWomRefresh(boolean manual)
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            requestPluginSync(manual);
+            return;
+        }
         if (womExecutor == null)
         {
             return;
@@ -1027,6 +1671,10 @@ public class ParentsGuildPlugin extends Plugin
 
     private void rescheduleWomRefresh()
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            return;
+        }
         if (womRefreshTask != null)
         {
             womRefreshTask.cancel(false);
@@ -1038,7 +1686,9 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        final int intervalSeconds = Math.max(30, config.womRefreshSeconds());
+        final int intervalSeconds = clanPanelRefreshSeconds > 0
+            ? Math.max(30, Math.min(3600, clanPanelRefreshSeconds))
+            : Math.max(30, config.womRefreshSeconds());
         womRefreshTask = womExecutor.scheduleWithFixedDelay(
             () -> requestWomRefresh(false),
             intervalSeconds,
@@ -1053,6 +1703,15 @@ public class ParentsGuildPlugin extends Plugin
         try
         {
             womPanelState = fetchClanPanelState(playerRsn, previousState);
+            bingoMembershipResolved = true;
+            if (isMatchedActiveBingoMember())
+            {
+                requestBingoStatusRefresh(false);
+            }
+            else
+            {
+                hideBingoBoardState();
+            }
             for (CompetitionView competitionView : womPanelState.getCompetitions())
             {
                 maybeWarnCompetitionEndingSoon(competitionView, Instant.now());
@@ -1103,6 +1762,11 @@ public class ParentsGuildPlugin extends Plugin
 
     private void requestPluginLocationSettings()
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            requestPluginSync(false);
+            return;
+        }
         final ScheduledExecutorService executor = womExecutor;
         final String endpoint = resolvePluginLocationSettingsEndpoint();
         if (executor == null || endpoint.isEmpty() || !config.enableLocationHeartbeat())
@@ -1131,6 +1795,11 @@ public class ParentsGuildPlugin extends Plugin
             locationSettingsTask = null;
         }
 
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            return;
+        }
+
         if (womExecutor == null || !config.enableLocationHeartbeat() || resolveEndpointBase(config.websiteBaseUrl()).isEmpty())
         {
             return;
@@ -1152,6 +1821,11 @@ public class ParentsGuildPlugin extends Plugin
             locationHeartbeatTask = null;
         }
 
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            return;
+        }
+
         if (womExecutor == null || !config.enableLocationHeartbeat() || resolveEndpointBase(config.websiteBaseUrl()).isEmpty())
         {
             return;
@@ -1167,6 +1841,11 @@ public class ParentsGuildPlugin extends Plugin
 
     private void requestLocationHeartbeat()
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            requestPluginSync(false);
+            return;
+        }
         final ScheduledExecutorService executor = womExecutor;
         final String endpoint = resolvePluginLocationHeartbeatEndpoint();
         if (executor == null || endpoint.isEmpty() || !config.enableLocationHeartbeat()
@@ -1226,6 +1905,43 @@ public class ParentsGuildPlugin extends Plugin
             && client.getVarpValue(VarPlayerID.OPTION_PM) != 2;
     }
 
+    private JsonObject buildDueLocationHeartbeatPayload(String playerRsn, long now)
+    {
+        if (!config.enableLocationHeartbeat()
+            || now - lastLocationHeartbeatAtMillis < TimeUnit.SECONDS.toMillis(locationHeartbeatIntervalSeconds)
+            || !canShareLocationHeartbeat()
+            || client.getVarbitValue(VarbitID.INSIDE_WILDERNESS) > 0)
+        {
+            return null;
+        }
+
+        final Player localPlayer = client.getLocalPlayer();
+        final boolean isOnBoat = localPlayer != null && localPlayer.getWorldView().getId() != WorldView.TOPLEVEL;
+        WorldPoint location = localPlayer == null
+            ? null
+            : WorldPoint.fromLocalInstance(client, localPlayer.getLocalLocation());
+        if (isOnBoat)
+        {
+            final WorldEntity boat = client.getTopLevelWorldView().worldEntities().byIndex(localPlayer.getWorldView().getId());
+            if (boat != null)
+            {
+                location = WorldPoint.fromLocalInstance(client, boat.getLocalLocation());
+            }
+        }
+        if (location == null || playerRsn.isEmpty())
+        {
+            return null;
+        }
+
+        final JsonObject payload = new JsonObject();
+        payload.addProperty("worldId", client.getWorld());
+        payload.addProperty("worldX", location.getX());
+        payload.addProperty("worldY", location.getY());
+        payload.addProperty("plane", location.getPlane());
+        payload.addProperty("isOnBoat", isOnBoat);
+        return payload;
+    }
+
     private void submitLocationHeartbeat(String endpoint, JsonObject payload)
     {
         final Request request = new Request.Builder()
@@ -1258,6 +1974,15 @@ public class ParentsGuildPlugin extends Plugin
 
     private void rescheduleClanChatRelay()
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            if (clanChatRelayTask != null)
+            {
+                clanChatRelayTask.cancel(false);
+                clanChatRelayTask = null;
+            }
+            return;
+        }
         scheduleClanChatRelay(CLAN_CHAT_RELAY_POLL_SECONDS, true);
     }
 
@@ -1293,6 +2018,10 @@ public class ParentsGuildPlugin extends Plugin
 
     private void requestClanChatRelayMessages()
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            return;
+        }
         if (!clanChatRelayPollInFlight.compareAndSet(false, true))
         {
             return;
@@ -1489,6 +2218,11 @@ public class ParentsGuildPlugin extends Plugin
 
     void requestBingoStatusRefresh(boolean manual)
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            requestPluginSync(manual);
+            return;
+        }
         requestBingoBoardRefresh(manual);
     }
 
@@ -1498,6 +2232,11 @@ public class ParentsGuildPlugin extends Plugin
         {
             bingoStatusTask.cancel(false);
             bingoStatusTask = null;
+        }
+
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            return;
         }
 
         if (womExecutor == null)
@@ -1602,6 +2341,11 @@ public class ParentsGuildPlugin extends Plugin
 
     void requestBingoBoardRefresh(boolean manual)
     {
+        if (pluginSyncMode != PluginSyncMode.LEGACY)
+        {
+            requestPluginSync(manual);
+            return;
+        }
         if (womExecutor == null)
         {
             return;
@@ -1611,10 +2355,16 @@ public class ParentsGuildPlugin extends Plugin
         final boolean shouldRefreshBoard = bingoBoardOverlayEnabled || config.enableBingoMetricTracking();
         if (!shouldRefreshOverlay && !shouldRefreshBoard)
         {
-            bingoBoardState = BingoBoardState.hidden();
-            bingoBoardCachedPayload = "";
-            bingoOverlayState = BingoOverlayState.hidden();
-            updateBingoBoardPopup();
+            hideBingoBoardState();
+            return;
+        }
+
+        if (!bingoMembershipResolved || !isMatchedActiveBingoMember())
+        {
+            if (bingoMembershipResolved)
+            {
+                hideBingoBoardState();
+            }
             return;
         }
 
@@ -1622,9 +2372,7 @@ public class ParentsGuildPlugin extends Plugin
         final String playerRsn = currentLocalPlayerName();
         if (endpoint.isEmpty() || playerRsn.isEmpty() || client.getGameState() != GameState.LOGGED_IN)
         {
-            bingoBoardState = BingoBoardState.hidden();
-            bingoBoardCachedPayload = "";
-            updateBingoBoardPopup();
+            hideBingoBoardState();
             return;
         }
 
@@ -1634,6 +2382,20 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         womExecutor.execute(() -> refreshBingoBoardState(endpoint, playerRsn, manual));
+    }
+
+    private boolean isMatchedActiveBingoMember()
+    {
+        final BingoPanelState bingo = womPanelState.getBingo();
+        return bingo != null && bingo.isActive() && bingo.isMatched();
+    }
+
+    private void hideBingoBoardState()
+    {
+        bingoBoardState = BingoBoardState.hidden();
+        bingoBoardCachedPayload = "";
+        bingoOverlayState = BingoOverlayState.hidden();
+        updateBingoBoardPopup();
     }
 
     // Side-panel actions
@@ -2488,7 +3250,10 @@ public class ParentsGuildPlugin extends Plugin
                         final String teamName = jsonString(responseJson, "teamName");
                         final String memberRsn = jsonString(responseJson, "memberRsn");
                         notifier.notify("ParentsGuild: bingo matched " + (teamName.isEmpty() ? "team" : teamName) + " / " + (memberRsn.isEmpty() ? playerRsn : memberRsn));
-                        requestBingoStatusRefresh(true);
+                        if (!queueBingoActionBoardPatch(responseJson, playerRsn))
+                        {
+                            requestBingoStatusRefresh(true);
+                        }
                         return;
                     }
 
@@ -2700,8 +3465,11 @@ public class ParentsGuildPlugin extends Plugin
                     {
                         final String tileLabel = firstNonBlank(jsonString(responseJson, "tileLabel"), cell.getLabel());
                         notifier.notify("ParentsGuild: proof submitted for \"" + tileLabel + "\". Pending host approval.");
-                        requestBingoStatusRefresh(true);
-                        requestBingoBoardRefresh(true);
+                        if (!queueBingoActionBoardPatch(responseJson, playerRsn))
+                        {
+                            requestBingoStatusRefresh(true);
+                            requestBingoBoardRefresh(true);
+                        }
                         return;
                     }
 
@@ -2710,7 +3478,10 @@ public class ParentsGuildPlugin extends Plugin
                         final String reason = jsonString(responseJson, "reason");
                         debugLog("Quiet bingo proof outcome=no_match tile={} reason={} response={}", cell.getLabel(), reason, responseBody);
                         notifier.notify("ParentsGuild: proof was not submitted" + (reason.isEmpty() ? "." : ": " + reason));
-                        requestBingoBoardRefresh(true);
+                        if (!queueBingoActionBoardPatch(responseJson, playerRsn))
+                        {
+                            requestBingoBoardRefresh(true);
+                        }
                         return;
                     }
 
@@ -2893,6 +3664,12 @@ public class ParentsGuildPlugin extends Plugin
         return base.isEmpty() ? "" : base + "/api/integrations/bingo-board.php";
     }
 
+    private String resolvePluginSyncEndpoint()
+    {
+        final String base = resolveEndpointBase(config.websiteBaseUrl());
+        return base.isEmpty() ? "" : base + "/api/integrations/plugin-sync.php";
+    }
+
     private String resolveClanPanelEndpoint()
     {
         final String base = resolveEndpointBase(config.websiteBaseUrl());
@@ -2984,6 +3761,7 @@ public class ParentsGuildPlugin extends Plugin
             + "?playerRsn=" + URLEncoder.encode(cleanedRsn, StandardCharsets.UTF_8.toString())
             + (cachedRevision.isEmpty() ? "" : "&panelRevision=" + URLEncoder.encode(cachedRevision, StandardCharsets.UTF_8.toString()));
         final JsonObject payload = getJsonObject(url);
+        applyClanPanelRefreshInterval(payload);
         if (!jsonBoolean(payload, "matched"))
         {
             return WomPanelState.message("Clan panel unavailable.", "This account is not on the active ParentsGuild roster.");
@@ -3015,6 +3793,21 @@ public class ParentsGuildPlugin extends Plugin
             : womEvents.getDetailMessage();
 
         return new WomPanelState(false, statusMessage, detail, profile, bingo, announcement, quickLinks, upcomingEvents, competitions);
+    }
+
+    private void applyClanPanelRefreshInterval(JsonObject payload)
+    {
+        if (payload == null || !payload.has("panelRefreshSeconds"))
+        {
+            return;
+        }
+
+        final int configuredInterval = Math.max(30, Math.min(3600, jsonInt(payload, "panelRefreshSeconds")));
+        if (configuredInterval != clanPanelRefreshSeconds)
+        {
+            clanPanelRefreshSeconds = configuredInterval;
+            rescheduleWomRefresh();
+        }
     }
 
     private ClanProfileState parseClanProfileState(JsonObject profile, String fallbackRsn)
@@ -3422,98 +4215,126 @@ public class ParentsGuildPlugin extends Plugin
                 throw new IOException("HTTP " + response.code() + " for " + endpoint + ": " + responseBody);
             }
 
-            final JsonObject payload = parseResponseJson(responseBody);
-            if (jsonBoolean(payload, "active") && jsonBoolean(payload, "matched"))
-            {
-                final String overlayTimeText = jsonString(payload, "overlayDateTime");
-                bingoOverlayState = overlayTimeText.isEmpty()
-                    ? BingoOverlayState.hidden()
-                    : new BingoOverlayState(true, jsonString(payload, "bingoName"), jsonString(payload, "teamName"), overlayTimeText);
-                handleSubmissionNotifications(jsonArray(payload, "submissionNotifications"), playerRsn);
-                handleCompletionNotifications(jsonArray(payload, "completionNotifications"), playerRsn);
-            }
-            else
-            {
-                bingoOverlayState = BingoOverlayState.hidden();
-            }
-            payload.remove("overlayDateTime");
-            final String payloadSignature = payload.toString();
-            if (payloadSignature.equals(bingoBoardCachedPayload))
-            {
-                return bingoBoardState;
-            }
-            bingoBoardCachedPayload = payloadSignature;
+            return parseBingoBoardPayload(parseResponseJson(responseBody), playerRsn, endpoint);
+        }
+    }
 
-            if (!jsonBoolean(payload, "active") || !jsonBoolean(payload, "matched"))
+    private BingoBoardState parseBingoBoardPayload(JsonObject payload, String playerRsn, String endpoint)
+    {
+        final String receivedBoardRevision = cleanText(jsonString(payload, "boardRevision"));
+        if (receivedBoardRevision.matches("[a-f0-9]{40}"))
+        {
+            bingoBoardRevision = receivedBoardRevision;
+        }
+        final String receivedNotificationRevision = cleanText(jsonString(payload, "notificationRevision"));
+        if (receivedNotificationRevision.matches("[a-f0-9]{40}"))
+        {
+            bingoNotificationRevision = receivedNotificationRevision;
+        }
+
+        if (jsonBoolean(payload, "active") && jsonBoolean(payload, "matched"))
+        {
+            final String overlayTimeText = jsonString(payload, "overlayDateTime");
+            if (!overlayTimeText.isEmpty())
             {
-                return BingoBoardState.hidden();
+                bingoOverlayState = new BingoOverlayState(true, jsonString(payload, "bingoName"), jsonString(payload, "teamName"), overlayTimeText);
+            }
+            handleSubmissionNotifications(jsonArray(payload, "submissionNotifications"), playerRsn);
+            handleCompletionNotifications(jsonArray(payload, "completionNotifications"), playerRsn);
+        }
+        else
+        {
+            bingoOverlayState = BingoOverlayState.hidden();
+        }
+
+        if (jsonBoolean(payload, "unchanged") && !payload.has("team"))
+        {
+            return bingoBoardState;
+        }
+
+        final JsonObject cachedPayload = parseResponseJson(payload.toString());
+        cachedPayload.remove("overlayDateTime");
+        cachedPayload.remove("submissionNotifications");
+        cachedPayload.remove("completionNotifications");
+        cachedPayload.remove("boardRevision");
+        cachedPayload.remove("notificationRevision");
+        cachedPayload.remove("unchanged");
+        final String payloadSignature = cachedPayload.toString();
+        if (payloadSignature.equals(bingoBoardCachedPayload))
+        {
+            return bingoBoardState;
+        }
+        bingoBoardCachedPayload = payloadSignature;
+
+        if (!jsonBoolean(payload, "active") || !jsonBoolean(payload, "matched"))
+        {
+            return BingoBoardState.hidden();
+        }
+
+        final String bingoName = jsonString(payload, "bingoName");
+        final String teamName = jsonString(payload, "teamName");
+        final JsonObject team = jsonObject(payload, "team");
+        final int rowsCount = Math.max(1, jsonInt(team, "rowsCount"));
+        final int colsCount = Math.max(1, jsonInt(team, "colsCount"));
+        final List<String> teamMembers = parseBoardTeamMembers(team);
+        final JsonArray gridArray = jsonArray(team, "grid");
+        final List<List<BingoBoardCell>> grid = new ArrayList<>();
+        for (JsonElement rowElement : gridArray)
+        {
+            if (!rowElement.isJsonArray())
+            {
+                continue;
             }
 
-            final String bingoName = jsonString(payload, "bingoName");
-            final String teamName = jsonString(payload, "teamName");
-            final JsonObject team = jsonObject(payload, "team");
-            final int rowsCount = Math.max(1, jsonInt(team, "rowsCount"));
-            final int colsCount = Math.max(1, jsonInt(team, "colsCount"));
-            final List<String> teamMembers = parseBoardTeamMembers(team);
-            final JsonArray gridArray = jsonArray(team, "grid");
-            final List<List<BingoBoardCell>> grid = new ArrayList<>();
-            for (JsonElement rowElement : gridArray)
+            final List<BingoBoardCell> row = new ArrayList<>();
+            for (JsonElement tileElement : rowElement.getAsJsonArray())
             {
-                if (!rowElement.isJsonArray())
+                if (!tileElement.isJsonObject())
                 {
                     continue;
                 }
 
-                final List<BingoBoardCell> row = new ArrayList<>();
-                for (JsonElement tileElement : rowElement.getAsJsonArray())
-                {
-                    if (!tileElement.isJsonObject())
-                    {
-                        continue;
-                    }
-
-                    final JsonObject tile = tileElement.getAsJsonObject();
-                    final String label = firstNonBlank(
-                        jsonString(tile, "label"),
-                        jsonString(tile, "dropItemName"),
-                        multiItemTileLabel(tile),
-                        jsonString(tile, "metricLabel"),
-                        normalizeTileTypeLabel(jsonString(tile, "tileType"))
-                    );
-                    row.add(new BingoBoardCell(
-                        jsonString(tile, "id"),
-                        label,
-                        buildBoardTooltip(tile),
-                        buildBoardProgressText(tile),
-                        jsonBoolean(tile, "isCompleted"),
-                        jsonBoolean(tile, "pendingClaim"),
-                        jsonString(tile, "tileType"),
-                        jsonString(tile, "metricKey"),
-                        jsonString(tile, "metricLabel"),
-                        Math.max(0L, jsonLong(tile, "progressValue")),
-                        Math.max(0L, jsonLong(tile, "pendingProgressValue")),
-                        Math.max(0L, jsonLong(tile, "targetValue")),
-                        Math.max(1, jsonInt(tile, "requiredCompletions")),
-                        Math.max(0, jsonInt(tile, "approvedCompletions")),
-                        Math.max(0, jsonInt(tile, "pendingCompletions")),
-                        parseMultiItemTileItems(tile),
-                        boardTileImage(endpoint, tile),
-                        multiMetricTileAcceptsScreenshotProof(tile)
-                    ));
-                }
-                if (!row.isEmpty())
-                {
-                    grid.add(row);
-                }
+                final JsonObject tile = tileElement.getAsJsonObject();
+                final String label = firstNonBlank(
+                    jsonString(tile, "label"),
+                    jsonString(tile, "dropItemName"),
+                    multiItemTileLabel(tile),
+                    jsonString(tile, "metricLabel"),
+                    normalizeTileTypeLabel(jsonString(tile, "tileType"))
+                );
+                row.add(new BingoBoardCell(
+                    jsonString(tile, "id"),
+                    label,
+                    buildBoardTooltip(tile),
+                    buildBoardProgressText(tile),
+                    jsonBoolean(tile, "isCompleted"),
+                    jsonBoolean(tile, "pendingClaim"),
+                    jsonString(tile, "tileType"),
+                    jsonString(tile, "metricKey"),
+                    jsonString(tile, "metricLabel"),
+                    Math.max(0L, jsonLong(tile, "progressValue")),
+                    Math.max(0L, jsonLong(tile, "pendingProgressValue")),
+                    Math.max(0L, jsonLong(tile, "targetValue")),
+                    Math.max(1, jsonInt(tile, "requiredCompletions")),
+                    Math.max(0, jsonInt(tile, "approvedCompletions")),
+                    Math.max(0, jsonInt(tile, "pendingCompletions")),
+                    parseMultiItemTileItems(tile),
+                    boardTileImage(endpoint, tile),
+                    multiMetricTileAcceptsScreenshotProof(tile)
+                ));
             }
-
-            if (bingoName.isEmpty() || teamName.isEmpty() || grid.isEmpty())
+            if (!row.isEmpty())
             {
-                return BingoBoardState.hidden();
+                grid.add(row);
             }
-
-            return new BingoBoardState(true, bingoName, teamName, teamMembers, rowsCount, colsCount, grid);
         }
+
+        if (bingoName.isEmpty() || teamName.isEmpty() || grid.isEmpty())
+        {
+            return BingoBoardState.hidden();
+        }
+
+        return new BingoBoardState(true, bingoName, teamName, teamMembers, rowsCount, colsCount, grid);
     }
 
     private static List<String> parseBoardTeamMembers(JsonObject team)
@@ -3733,7 +4554,7 @@ public class ParentsGuildPlugin extends Plugin
         {
             final String updatedAt = cleanText(jsonString(tile, "backgroundImageUpdatedAt"));
             final String version = updatedAt.isEmpty() ? "" : "&v=" + urlEncode(updatedAt);
-            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId) + "&format=png" + version));
+            return loadBoardTileImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId) + "&format=png" + version));
         }
 
         if ("multi_item".equals(normalizeName(jsonString(tile, "tileType"))))
@@ -3758,9 +4579,45 @@ public class ParentsGuildPlugin extends Plugin
         final String metricKey = cleanText(jsonString(tile, "metricKey"));
         if ("metric".equals(normalizeName(jsonString(tile, "tileType"))) && metricKey.startsWith("boss:"))
         {
-            return loadRemoteImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-icon.php?metricKey=" + urlEncode(metricKey) + "&format=png"));
+            return loadBoardTileImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-icon.php?metricKey=" + urlEncode(metricKey) + "&format=png"));
         }
 
+        return null;
+    }
+
+    private BufferedImage loadBoardTileImage(String imageUrl)
+    {
+        if (imageUrl.isEmpty())
+        {
+            return null;
+        }
+
+        final BufferedImage memoryImage = bingoBoardImageCache.get(imageUrl);
+        if (memoryImage != null)
+        {
+            return memoryImage;
+        }
+        final BufferedImage diskImage = loadCachedPluginImage(imageUrl);
+        if (diskImage != null)
+        {
+            bingoBoardImageCache.put(imageUrl, diskImage);
+            return diskImage;
+        }
+
+        if (womExecutor != null && queuedBoardImageUrls.add(imageUrl))
+        {
+            womExecutor.execute(() -> {
+                try
+                {
+                    loadRemoteImage(imageUrl);
+                }
+                finally
+                {
+                    queuedBoardImageUrls.remove(imageUrl);
+                    requestBingoBoardImageRefresh();
+                }
+            });
+        }
         return null;
     }
 
@@ -3852,8 +4709,34 @@ public class ParentsGuildPlugin extends Plugin
         }
         womExecutor.schedule(() -> {
             bingoBoardImageRefreshQueued.set(false);
-            updateBingoBoardPopup();
+            refreshBingoBoardImagesFromCache();
         }, 1, TimeUnit.SECONDS);
+    }
+
+    private void refreshBingoBoardImagesFromCache()
+    {
+        if (!bingoBoardState.isVisible() || bingoBoardCachedPayload.isEmpty())
+        {
+            updateBingoBoardPopup();
+            return;
+        }
+
+        final String playerRsn = cleanText(lastLoggedInRsn);
+        final String endpoint = resolveBingoBoardEndpoint();
+        if (playerRsn.isEmpty() || endpoint.isEmpty())
+        {
+            updateBingoBoardPopup();
+            return;
+        }
+
+        final JsonObject cachedPayload = parseResponseJson(bingoBoardCachedPayload);
+        bingoBoardCachedPayload = "";
+        final BingoBoardState refreshed = parseBingoBoardPayload(cachedPayload, playerRsn, endpoint);
+        if (refreshed != bingoBoardState)
+        {
+            bingoBoardState = refreshed;
+        }
+        updateBingoBoardPopup();
     }
 
     private static void drawScaledImage(Graphics2D graphics, BufferedImage image, int x, int y, int width, int height)
@@ -3881,6 +4764,13 @@ public class ParentsGuildPlugin extends Plugin
             return cachedImage;
         }
 
+        final BufferedImage diskCachedImage = loadCachedPluginImage(imageUrl);
+        if (diskCachedImage != null)
+        {
+            bingoBoardImageCache.put(imageUrl, diskCachedImage);
+            return diskCachedImage;
+        }
+
         final Request request = new Request.Builder()
             .url(imageUrl)
             .header("Accept", "image/png,image/jpeg,image/webp,image/*")
@@ -3892,10 +4782,12 @@ public class ParentsGuildPlugin extends Plugin
                 return null;
             }
 
-            final BufferedImage image = ImageIO.read(new ByteArrayInputStream(response.body().bytes()));
+            final byte[] imageBytes = response.body().bytes();
+            final BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageBytes));
             if (image != null)
             {
                 bingoBoardImageCache.put(imageUrl, image);
+                storeCachedPluginImage(imageUrl, imageBytes);
             }
             return image;
         }
@@ -3906,6 +4798,122 @@ public class ParentsGuildPlugin extends Plugin
                 log.debug("Failed to load bingo board image {}", imageUrl, ex);
             }
             return null;
+        }
+    }
+
+    private BufferedImage loadCachedPluginImage(String imageUrl)
+    {
+        final File file = pluginImageCacheFile(imageUrl);
+        if (!file.isFile() || file.length() <= 0L)
+        {
+            return null;
+        }
+
+        try
+        {
+            final BufferedImage image = ImageIO.read(file);
+            if (image != null)
+            {
+                file.setLastModified(System.currentTimeMillis());
+                return image;
+            }
+        }
+        catch (IOException | RuntimeException ex)
+        {
+            if (config.debug())
+            {
+                log.debug("Failed to read cached ParentsGuild image {}", file.getName(), ex);
+            }
+        }
+        if (!file.delete() && config.debug())
+        {
+            log.debug("Could not remove unreadable ParentsGuild image cache file {}", file.getName());
+        }
+        return null;
+    }
+
+    private void storeCachedPluginImage(String imageUrl, byte[] imageBytes)
+    {
+        if (imageBytes == null || imageBytes.length == 0 || imageBytes.length > 5 * 1024 * 1024)
+        {
+            return;
+        }
+
+        final File target = pluginImageCacheFile(imageUrl);
+        final File directory = target.getParentFile();
+        if (directory == null || (!directory.exists() && !directory.mkdirs()))
+        {
+            return;
+        }
+
+        final File temporary = new File(directory, target.getName() + ".tmp");
+        try
+        {
+            try (FileOutputStream output = new FileOutputStream(temporary))
+            {
+                output.write(imageBytes);
+                output.flush();
+            }
+            try
+            {
+                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            }
+            catch (IOException ignored)
+            {
+                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+            prunePluginImageCache(directory);
+        }
+        catch (IOException ex)
+        {
+            if (config.debug())
+            {
+                log.debug("Failed to cache ParentsGuild image {}", imageUrl, ex);
+            }
+            if (temporary.isFile())
+            {
+                temporary.delete();
+            }
+        }
+    }
+
+    private File pluginImageCacheFile(String imageUrl)
+    {
+        return new File(new File(System.getProperty("user.home"), ".runelite/parentsguild/image-cache"), sha1(imageUrl) + ".img");
+    }
+
+    private static void prunePluginImageCache(File directory)
+    {
+        final File[] files = directory.listFiles(file -> file.isFile() && file.getName().endsWith(".img"));
+        if (files == null)
+        {
+            return;
+        }
+
+        final List<File> entries = new ArrayList<>();
+        long totalBytes = 0L;
+        for (File file : files)
+        {
+            entries.add(file);
+            totalBytes += Math.max(0L, file.length());
+        }
+        if (totalBytes <= PLUGIN_IMAGE_CACHE_MAX_BYTES)
+        {
+            return;
+        }
+
+        entries.sort((left, right) -> Long.compare(left.lastModified(), right.lastModified()));
+        for (File file : entries)
+        {
+            if (totalBytes <= PLUGIN_IMAGE_CACHE_MAX_BYTES)
+            {
+                break;
+            }
+            final long size = Math.max(0L, file.length());
+            if (file.delete())
+            {
+                totalBytes -= size;
+            }
         }
     }
 
@@ -4447,6 +5455,30 @@ public class ParentsGuildPlugin extends Plugin
         private static final DecimalFormat ONE_DECIMAL = new DecimalFormat("#,##0.#");
         private static final DecimalFormat DECIMAL = new DecimalFormat("#,##0.##");
         private static final DecimalFormat TWO_DECIMAL = new DecimalFormat("0.00");
+    }
+
+    private enum PluginSyncMode
+    {
+        UNKNOWN,
+        UNIFIED,
+        LEGACY
+    }
+
+    private static final class PendingXpMetricBatch
+    {
+        private String eventId;
+        private String metricBatchKey;
+        private String playerRsn;
+        private String tileId;
+        private String metricKey;
+        private String metricLabel;
+        private long gainedValue;
+        private long pluginProgressValue;
+        private long targetValue;
+        private String capturedAtUtc;
+        private long createdAtMillis;
+        private long dueAtMillis;
+        private boolean inFlight;
     }
 
     // State models
