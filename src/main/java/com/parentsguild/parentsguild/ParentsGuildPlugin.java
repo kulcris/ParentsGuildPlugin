@@ -13,12 +13,12 @@ import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.URLEncoder;
-import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
@@ -46,6 +46,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 import javax.imageio.ImageIO;
 import javax.inject.Inject;
 import javax.swing.JOptionPane;
@@ -94,6 +95,7 @@ import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.ImageUtil;
 import net.runelite.client.util.AsyncBufferedImage;
+import net.runelite.client.util.Filepath;
 import net.runelite.client.util.LinkBrowser;
 import net.runelite.client.util.Text;
 import okhttp3.Call;
@@ -4803,31 +4805,31 @@ public class ParentsGuildPlugin extends Plugin
 
     private BufferedImage loadCachedPluginImage(String imageUrl)
     {
-        final File file = pluginImageCacheFile(imageUrl);
-        if (!file.isFile() || file.length() <= 0L)
-        {
-            return null;
-        }
-
         try
         {
-            final BufferedImage image = ImageIO.read(file);
+            final Filepath file = pluginImageCacheFile(imageUrl);
+            if (!file.isFile() || file.size() <= 0L)
+            {
+                return null;
+            }
+
+            final BufferedImage image;
+            try (InputStream input = file.openInputStream())
+            {
+                image = ImageIO.read(input);
+            }
             if (image != null)
             {
-                file.setLastModified(System.currentTimeMillis());
                 return image;
             }
+            file.deleteIfExists();
         }
         catch (IOException | RuntimeException ex)
         {
             if (config.debug())
             {
-                log.debug("Failed to read cached ParentsGuild image {}", file.getName(), ex);
+                log.debug("Failed to read cached ParentsGuild image", ex);
             }
-        }
-        if (!file.delete() && config.debug())
-        {
-            log.debug("Could not remove unreadable ParentsGuild image cache file {}", file.getName());
         }
         return null;
     }
@@ -4839,28 +4841,25 @@ public class ParentsGuildPlugin extends Plugin
             return;
         }
 
-        final File target = pluginImageCacheFile(imageUrl);
-        final File directory = target.getParentFile();
-        if (directory == null || (!directory.exists() && !directory.mkdirs()))
-        {
-            return;
-        }
-
-        final File temporary = new File(directory, target.getName() + ".tmp");
+        Filepath temporary = null;
         try
         {
-            try (FileOutputStream output = new FileOutputStream(temporary))
+            final Filepath target = pluginImageCacheFile(imageUrl);
+            final Filepath directory = target.getParent();
+            directory.createDirectories();
+            temporary = directory.createTempFile("parentsguild-image-", ".tmp");
+            try (OutputStream output = temporary.openOutputStream())
             {
                 output.write(imageBytes);
                 output.flush();
             }
             try
             {
-                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                temporary.moveTo(target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             }
-            catch (IOException ignored)
+            catch (AtomicMoveNotSupportedException ignored)
             {
-                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                temporary.moveTo(target, StandardCopyOption.REPLACE_EXISTING);
             }
             prunePluginImageCache(directory);
         }
@@ -4870,50 +4869,61 @@ public class ParentsGuildPlugin extends Plugin
             {
                 log.debug("Failed to cache ParentsGuild image {}", imageUrl, ex);
             }
-            if (temporary.isFile())
+            if (temporary != null)
             {
-                temporary.delete();
+                try
+                {
+                    temporary.deleteIfExists();
+                }
+                catch (IOException ignored)
+                {
+                    // The failed cache write is non-critical.
+                }
             }
         }
     }
 
-    private File pluginImageCacheFile(String imageUrl)
+    private Filepath pluginImageCacheFile(String imageUrl) throws IOException
     {
-        return new File(new File(System.getProperty("user.home"), ".runelite/parentsguild/image-cache"), sha1(imageUrl) + ".img");
+        return getPluginDirectory().join("image-cache", sha1(imageUrl) + ".img");
     }
 
-    private static void prunePluginImageCache(File directory)
+    private static void prunePluginImageCache(Filepath directory) throws IOException
     {
-        final File[] files = directory.listFiles(file -> file.isFile() && file.getName().endsWith(".img"));
-        if (files == null)
+        final List<Filepath> entries = new ArrayList<>();
+        try (Stream<Filepath> files = directory.walk(1))
         {
-            return;
+            files.filter(file -> file.isFile() && file.getFileName().endsWith(".img")).forEach(entries::add);
         }
-
-        final List<File> entries = new ArrayList<>();
         long totalBytes = 0L;
-        for (File file : files)
+        for (Filepath file : entries)
         {
-            entries.add(file);
-            totalBytes += Math.max(0L, file.length());
+            totalBytes += Math.max(0L, file.size());
         }
         if (totalBytes <= PLUGIN_IMAGE_CACHE_MAX_BYTES)
         {
             return;
         }
 
-        entries.sort((left, right) -> Long.compare(left.lastModified(), right.lastModified()));
-        for (File file : entries)
+        entries.sort((left, right) -> {
+            try
+            {
+                return left.getLastModifiedTime().compareTo(right.getLastModifiedTime());
+            }
+            catch (IOException ex)
+            {
+                return 0;
+            }
+        });
+        for (Filepath file : entries)
         {
             if (totalBytes <= PLUGIN_IMAGE_CACHE_MAX_BYTES)
             {
                 break;
             }
-            final long size = Math.max(0L, file.length());
-            if (file.delete())
-            {
-                totalBytes -= size;
-            }
+            final long size = Math.max(0L, file.size());
+            file.deleteIfExists();
+            totalBytes -= size;
         }
     }
 
