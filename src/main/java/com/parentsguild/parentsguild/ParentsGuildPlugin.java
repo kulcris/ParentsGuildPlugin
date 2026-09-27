@@ -142,6 +142,8 @@ public class ParentsGuildPlugin extends Plugin
     private static final int PLUGIN_SYNC_IDLE_SECONDS = 900;
     private static final long PLUGIN_SYNC_RETRY_MAX_MILLIS = TimeUnit.MINUTES.toMillis(5);
     private static final long XP_METRIC_BATCH_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    private static final long LIFETIME_LOOT_BATCH_MILLIS = TimeUnit.MINUTES.toMillis(5);
+    private static final long LIFETIME_LOOT_RETRY_MILLIS = TimeUnit.MINUTES.toMillis(1);
     private static final String XP_BATCHES_CONFIG_KEY = "pendingXpMetricBatchesV2";
     private static final long PLUGIN_IMAGE_CACHE_MAX_BYTES = 50L * 1024L * 1024L;
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
@@ -235,6 +237,7 @@ public class ParentsGuildPlugin extends Plugin
     private final Map<String, Integer> lastAbsoluteMetricCountByKey = new ConcurrentHashMap<>();
     private final Map<String, Integer> clanChatRankIconIds = new ConcurrentHashMap<>();
     private final Map<String, Long> recentInjectedDiscordMessages = new ConcurrentHashMap<>();
+    private final List<QueuedLifetimeLoot> lifetimeLootQueue = new ArrayList<>();
     private final Set<String> metricWomUpdateReminderTileIds = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean womRefreshInFlight = new AtomicBoolean(false);
     private final AtomicBoolean bingoStatusRefreshInFlight = new AtomicBoolean(false);
@@ -289,6 +292,7 @@ public class ParentsGuildPlugin extends Plugin
     private ScheduledFuture<?> locationSettingsTask;
     private ScheduledFuture<?> clanChatRelayTask;
     private ScheduledFuture<?> pluginSyncTask;
+    private ScheduledFuture<?> lifetimeLootFlushTask;
     private ParentsGuildPanel womPanel;
     private NavigationButton womNavigationButton;
     private ParentsGuildBingoOverlay bingoOverlay;
@@ -306,6 +310,7 @@ public class ParentsGuildPlugin extends Plugin
     protected void startUp()
     {
         recentDropEventIds.clear();
+        lifetimeLootQueue.clear();
         seenSubmissionNotificationIds.clear();
         seenCompletionNotificationIds.clear();
         bingoBoardImageCache.clear();
@@ -399,6 +404,7 @@ public class ParentsGuildPlugin extends Plugin
     {
         persistPendingXpMetricBatches();
         recentDropEventIds.clear();
+        lifetimeLootQueue.clear();
         seenSubmissionNotificationIds.clear();
         seenCompletionNotificationIds.clear();
         queuedBoardImageUrls.clear();
@@ -454,6 +460,11 @@ public class ParentsGuildPlugin extends Plugin
         {
             pluginSyncTask.cancel(true);
             pluginSyncTask = null;
+        }
+        if (lifetimeLootFlushTask != null)
+        {
+            lifetimeLootFlushTask.cancel(true);
+            lifetimeLootFlushTask = null;
         }
         if (womRefreshTask != null)
         {
@@ -2902,13 +2913,18 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         womExecutor.execute(() -> {
+            final List<PendingDrop> bingoDrops = bingoDropsEnabled
+                ? filterDropsForIncompleteBingoTiles(playerRsn, drops)
+                : new ArrayList<>();
+            if (!bingoDrops.isEmpty())
+            {
+                submitEligibleDropScreenshots(bingoEndpoint, playerRsn, cleanedSourceName, bingoDrops);
+            }
             if (lifetimeLootEnabled)
             {
-                submitLifetimeLoot(lifetimeEndpoint, playerRsn, cleanedSourceName, drops);
-            }
-            if (bingoDropsEnabled)
-            {
-                submitEligibleDropScreenshots(bingoEndpoint, playerRsn, cleanedSourceName, drops);
+                // A verified Bingo drop should appear in Lifetime Loot immediately;
+                // ordinary drops are sent together on the five-minute queue.
+                queueLifetimeLoot(lifetimeEndpoint, playerRsn, cleanedSourceName, drops, !bingoDrops.isEmpty());
             }
         });
     }
@@ -2935,8 +2951,7 @@ public class ParentsGuildPlugin extends Plugin
 
     private void submitEligibleDropScreenshots(String dropEndpoint, String playerRsn, String sourceName, List<PendingDrop> drops)
     {
-        final List<PendingDrop> eligibleDrops = filterDropsForIncompleteBingoTiles(playerRsn, drops);
-        if (eligibleDrops.isEmpty())
+        if (drops.isEmpty())
         {
             debugLog("Skipping bingo drop screenshot because no dropped items matched incomplete drop tiles.");
             return;
@@ -2952,7 +2967,7 @@ public class ParentsGuildPlugin extends Plugin
                 }
 
                 final byte[] screenshotBytes = toPngBytes(image);
-                for (PendingDrop drop : eligibleDrops)
+                for (PendingDrop drop : drops)
                 {
                     submitDrop(dropEndpoint, playerRsn, sourceName, drop, screenshotBytes);
                 }
@@ -3280,50 +3295,111 @@ public class ParentsGuildPlugin extends Plugin
         });
     }
 
-    private void submitLifetimeLoot(String endpoint, String playerRsn, String sourceName, List<PendingDrop> drops)
+    private void queueLifetimeLoot(String endpoint, String playerRsn, String sourceName, List<PendingDrop> drops, boolean flushImmediately)
     {
+        if (drops.isEmpty())
+        {
+            return;
+        }
+
+        final boolean seasonalWorld = client.getWorldType().contains(WorldType.SEASONAL);
         for (PendingDrop drop : drops)
         {
-            final FormBody body = new FormBody.Builder()
-                .add("source", "runelite_plugin")
-                .add("eventId", drop.getEventId())
-                .add("playerRsn", playerRsn)
-                .add("itemId", Integer.toString(drop.getItemId()))
-                .add("itemName", drop.getItemName())
-                .add("quantity", Integer.toString(drop.getQuantity()))
-                .add("unitValue", Long.toString(drop.getUnitValue()))
-                .add("sourceName", sourceName)
-                .add("worldId", Integer.toString(drop.getLocation().getWorldId()))
-                .add("worldX", Integer.toString(drop.getLocation().getX()))
-                .add("worldY", Integer.toString(drop.getLocation().getY()))
-                .add("plane", Integer.toString(drop.getLocation().getPlane()))
-                .add("capturedAtUtc", drop.getCapturedAtUtc())
-                .add("seasonalWorld", Boolean.toString(client.getWorldType().contains(WorldType.SEASONAL)))
-                .build();
-            final Request request = new Request.Builder().url(endpoint).header("Accept", "application/json").post(body).build();
-            okHttpClient.newCall(request).enqueue(new Callback()
-            {
-                @Override
-                public void onFailure(Call call, IOException e)
-                {
-                    log.warn("Lifetime Loot submission failed", e);
-                }
+            lifetimeLootQueue.add(new QueuedLifetimeLoot(endpoint, playerRsn, sourceName, drop, seasonalWorld));
+        }
 
-                @Override
-                public void onResponse(Call call, Response response) throws IOException
-                {
-                    try (Response httpResponse = response)
-                    {
-                        final String responseBody = httpResponse.body() != null ? httpResponse.body().string() : "";
-                        if (!httpResponse.isSuccessful())
-                        {
-                            log.warn("Lifetime Loot endpoint returned HTTP {}: {}", httpResponse.code(), responseBody);
-                            return;
-                        }
-                        debugLog("Lifetime Loot outcome={} item={}", jsonString(parseResponseJson(responseBody), "outcome"), drop.getItemName());
-                    }
-                }
-            });
+        if (flushImmediately)
+        {
+            if (lifetimeLootFlushTask != null)
+            {
+                lifetimeLootFlushTask.cancel(false);
+                lifetimeLootFlushTask = null;
+            }
+            flushLifetimeLootQueue();
+            return;
+        }
+
+        if (lifetimeLootFlushTask == null || lifetimeLootFlushTask.isDone())
+        {
+            lifetimeLootFlushTask = womExecutor.schedule(
+                this::flushLifetimeLootQueue,
+                LIFETIME_LOOT_BATCH_MILLIS,
+                TimeUnit.MILLISECONDS
+            );
+        }
+    }
+
+    private void flushLifetimeLootQueue()
+    {
+        lifetimeLootFlushTask = null;
+        if (lifetimeLootQueue.isEmpty())
+        {
+            return;
+        }
+
+        final List<QueuedLifetimeLoot> batch = new ArrayList<>(lifetimeLootQueue);
+        lifetimeLootQueue.clear();
+        try
+        {
+            submitLifetimeLootBatch(batch);
+        }
+        catch (IOException ex)
+        {
+            log.warn("Lifetime Loot batch submission failed; retrying in one minute", ex);
+            lifetimeLootQueue.addAll(0, batch);
+            if (womExecutor != null)
+            {
+                lifetimeLootFlushTask = womExecutor.schedule(
+                    this::flushLifetimeLootQueue,
+                    LIFETIME_LOOT_RETRY_MILLIS,
+                    TimeUnit.MILLISECONDS
+                );
+            }
+        }
+    }
+
+    private void submitLifetimeLootBatch(List<QueuedLifetimeLoot> batch) throws IOException
+    {
+        final QueuedLifetimeLoot first = batch.get(0);
+        final JsonArray entries = new JsonArray();
+        for (QueuedLifetimeLoot queued : batch)
+        {
+            final PendingDrop drop = queued.getDrop();
+            final JsonObject entry = new JsonObject();
+            entry.addProperty("eventId", drop.getEventId());
+            entry.addProperty("playerRsn", queued.getPlayerRsn());
+            entry.addProperty("itemId", drop.getItemId());
+            entry.addProperty("itemName", drop.getItemName());
+            entry.addProperty("quantity", drop.getQuantity());
+            entry.addProperty("unitValue", drop.getUnitValue());
+            entry.addProperty("sourceName", queued.getSourceName());
+            entry.addProperty("worldId", drop.getLocation().getWorldId());
+            entry.addProperty("worldX", drop.getLocation().getX());
+            entry.addProperty("worldY", drop.getLocation().getY());
+            entry.addProperty("plane", drop.getLocation().getPlane());
+            entry.addProperty("capturedAtUtc", drop.getCapturedAtUtc());
+            entry.addProperty("seasonalWorld", queued.isSeasonalWorld());
+            entries.add(entry);
+        }
+
+        final FormBody body = new FormBody.Builder()
+            .add("source", "runelite_plugin")
+            .add("entries", gson.toJson(entries))
+            .build();
+        final Request request = new Request.Builder()
+            .url(first.getEndpoint())
+            .header("Accept", "application/json")
+            .post(body)
+            .build();
+
+        try (Response response = okHttpClient.newCall(request).execute())
+        {
+            final String responseBody = response.body() != null ? response.body().string() : "";
+            if (!response.isSuccessful())
+            {
+                throw new IOException("HTTP " + response.code() + " from Lifetime Loot endpoint: " + responseBody);
+            }
+            debugLog("Lifetime Loot batch outcome={} entries={}", jsonString(parseResponseJson(responseBody), "outcome"), batch.size());
         }
     }
 
@@ -5507,6 +5583,16 @@ public class ParentsGuildPlugin extends Plugin
         long unitValue;
         String capturedAtUtc;
         DropLocation location;
+    }
+
+    @Value
+    private static class QueuedLifetimeLoot
+    {
+        String endpoint;
+        String playerRsn;
+        String sourceName;
+        PendingDrop drop;
+        boolean seasonalWorld;
     }
 
     @Value
