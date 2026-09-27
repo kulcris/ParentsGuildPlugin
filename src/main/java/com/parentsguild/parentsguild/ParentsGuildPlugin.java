@@ -40,6 +40,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -144,6 +145,7 @@ public class ParentsGuildPlugin extends Plugin
     private static final long XP_METRIC_BATCH_MILLIS = TimeUnit.MINUTES.toMillis(5);
     private static final long LIFETIME_LOOT_BATCH_MILLIS = TimeUnit.MINUTES.toMillis(5);
     private static final long LIFETIME_LOOT_RETRY_MILLIS = TimeUnit.MINUTES.toMillis(1);
+    private static final long BOARD_IMAGE_REFRESH_DEBOUNCE_MILLIS = 100L;
     private static final String XP_BATCHES_CONFIG_KEY = "pendingXpMetricBatchesV2";
     private static final long PLUGIN_IMAGE_CACHE_MAX_BYTES = 50L * 1024L * 1024L;
     private static final Map<Integer, String> BINGO_REWARD_CONTAINER_NAMES = Map.of(
@@ -285,6 +287,7 @@ public class ParentsGuildPlugin extends Plugin
     private volatile boolean bingoBoardOverlayEnabled = false;
     private ScheduledExecutorService womExecutor;
     private ScheduledExecutorService clanChatRelayExecutor;
+    private ExecutorService boardImageExecutor;
     private ScheduledFuture<?> womRefreshTask;
     private ScheduledFuture<?> bingoStatusTask;
     private ScheduledFuture<?> bingoBoardTask;
@@ -377,6 +380,11 @@ public class ParentsGuildPlugin extends Plugin
         });
         clanChatRelayExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             final Thread thread = new Thread(runnable, "parentsguild-clan-chat");
+            thread.setDaemon(true);
+            return thread;
+        });
+        boardImageExecutor = Executors.newFixedThreadPool(4, runnable -> {
+            final Thread thread = new Thread(runnable, "parentsguild-board-image");
             thread.setDaemon(true);
             return thread;
         });
@@ -505,6 +513,11 @@ public class ParentsGuildPlugin extends Plugin
         {
             clanChatRelayExecutor.shutdownNow();
             clanChatRelayExecutor = null;
+        }
+        if (boardImageExecutor != null)
+        {
+            boardImageExecutor.shutdownNow();
+            boardImageExecutor = null;
         }
         if (womNavigationButton != null)
         {
@@ -1468,11 +1481,7 @@ public class ParentsGuildPlugin extends Plugin
                 playerRsn,
                 resolveBingoBoardEndpoint()
             );
-            if (nextBoardState != bingoBoardState)
-            {
-                bingoBoardState = nextBoardState;
-                updateBingoBoardPopup();
-            }
+            applyBingoBoardState(nextBoardState);
         }
         else if (bingoMembershipResolved && !isMatchedActiveBingoMember())
         {
@@ -1632,11 +1641,7 @@ public class ParentsGuildPlugin extends Plugin
             playerRsn,
             resolveBingoBoardEndpoint()
         );
-        if (nextBoardState != bingoBoardState)
-        {
-            bingoBoardState = nextBoardState;
-            updateBingoBoardPopup();
-        }
+        applyBingoBoardState(nextBoardState);
         pushPanelState();
     }
 
@@ -2297,6 +2302,8 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         bingoBoardOverlayEnabled = true;
+        bingoBoardRevision = "";
+        bingoBoardCachedPayload = "";
         SwingUtilities.invokeLater(() -> {
             if (bingoBoardPopup == null)
             {
@@ -2403,8 +2410,23 @@ public class ParentsGuildPlugin extends Plugin
         return bingo != null && bingo.isActive() && bingo.isMatched();
     }
 
+    private void applyBingoBoardState(BingoBoardState nextBoardState)
+    {
+        if (nextBoardState == bingoBoardState
+            || (bingoBoardState.isVisible() && !nextBoardState.isVisible() && client.getGameState() == GameState.LOGGED_IN))
+        {
+            return;
+        }
+        bingoBoardState = nextBoardState;
+        updateBingoBoardPopup();
+    }
+
     private void hideBingoBoardState()
     {
+        if (bingoBoardState.isVisible() && client.getGameState() == GameState.LOGGED_IN)
+        {
+            return;
+        }
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
         // A hidden board cannot safely accept an "unchanged" response because it
@@ -2549,18 +2571,17 @@ public class ParentsGuildPlugin extends Plugin
                 return;
             }
 
-            if (nextBoardState != bingoBoardState)
-            {
-                bingoBoardState = nextBoardState;
-                updateBingoBoardPopup();
-            }
+            applyBingoBoardState(nextBoardState);
             pushPanelState();
         }
         catch (Exception ex)
         {
-            bingoBoardState = BingoBoardState.hidden();
-            bingoBoardCachedPayload = "";
-            updateBingoBoardPopup();
+            if (!bingoBoardState.isVisible())
+            {
+                bingoBoardState = BingoBoardState.hidden();
+                bingoBoardCachedPayload = "";
+                updateBingoBoardPopup();
+            }
             pushPanelState();
             if (config.debug() || manual)
             {
@@ -4634,6 +4655,11 @@ public class ParentsGuildPlugin extends Plugin
         final String tileId = cleanText(jsonString(tile, "id"));
         if (!tileId.isEmpty() && !cleanText(jsonString(tile, "backgroundImageStorageName")).isEmpty())
         {
+            final String imagePath = cleanText(jsonString(tile, "backgroundImageUrl"));
+            if (!imagePath.isEmpty())
+            {
+                return loadBoardTileImage(configuredWebsiteApiUrl(endpoint, imagePath + (imagePath.contains("?") ? "&" : "?") + "format=png"));
+            }
             final String updatedAt = cleanText(jsonString(tile, "backgroundImageUpdatedAt"));
             final String version = updatedAt.isEmpty() ? "" : "&v=" + urlEncode(updatedAt);
             return loadBoardTileImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-tile-background.php?id=" + urlEncode(tileId) + "&format=png" + version));
@@ -4659,11 +4685,11 @@ public class ParentsGuildPlugin extends Plugin
         }
 
         final String metricKey = cleanText(jsonString(tile, "metricKey"));
-        if ("metric".equals(normalizeName(jsonString(tile, "tileType"))) && metricKey.startsWith("boss:"))
+        if ("metric".equals(normalizeName(jsonString(tile, "tileType")))
+            && (metricKey.startsWith("skill:") || metricKey.startsWith("boss:") || metricKey.startsWith("activity:")))
         {
             return loadBoardTileImage(configuredWebsiteApiUrl(endpoint, "/api/bingo-icon.php?metricKey=" + urlEncode(metricKey) + "&format=png"));
         }
-
         return null;
     }
 
@@ -4674,21 +4700,25 @@ public class ParentsGuildPlugin extends Plugin
             return null;
         }
 
-        final BufferedImage memoryImage = bingoBoardImageCache.get(imageUrl);
-        if (memoryImage != null)
+        final BufferedImage cachedImage = loadBoardTileImageFromCache(imageUrl);
+        if (cachedImage != null)
         {
-            return memoryImage;
-        }
-        final BufferedImage diskImage = loadCachedPluginImage(imageUrl);
-        if (diskImage != null)
-        {
-            bingoBoardImageCache.put(imageUrl, diskImage);
-            return diskImage;
+            return cachedImage;
         }
 
-        if (womExecutor != null && queuedBoardImageUrls.add(imageUrl))
+        if (bingoBoardOverlayEnabled)
         {
-            womExecutor.execute(() -> {
+            final BufferedImage loadedImage = loadRemoteImage(imageUrl);
+            if (loadedImage != null)
+            {
+                return loadedImage;
+            }
+        }
+
+        final ExecutorService imageExecutor = boardImageExecutor;
+        if (imageExecutor != null && queuedBoardImageUrls.add(imageUrl))
+        {
+            imageExecutor.execute(() -> {
                 try
                 {
                     loadRemoteImage(imageUrl);
@@ -4701,6 +4731,21 @@ public class ParentsGuildPlugin extends Plugin
             });
         }
         return null;
+    }
+
+    private BufferedImage loadBoardTileImageFromCache(String imageUrl)
+    {
+        final BufferedImage memoryImage = bingoBoardImageCache.get(imageUrl);
+        if (memoryImage != null)
+        {
+            return memoryImage;
+        }
+        final BufferedImage diskImage = loadCachedPluginImage(imageUrl);
+        if (diskImage != null)
+        {
+            bingoBoardImageCache.put(imageUrl, diskImage);
+        }
+        return diskImage;
     }
 
     private BufferedImage multiItemTileImage(JsonObject tile)
@@ -4792,7 +4837,7 @@ public class ParentsGuildPlugin extends Plugin
         womExecutor.schedule(() -> {
             bingoBoardImageRefreshQueued.set(false);
             refreshBingoBoardImagesFromCache();
-        }, 1, TimeUnit.SECONDS);
+        }, BOARD_IMAGE_REFRESH_DEBOUNCE_MILLIS, TimeUnit.MILLISECONDS);
     }
 
     private void refreshBingoBoardImagesFromCache()
@@ -4814,10 +4859,7 @@ public class ParentsGuildPlugin extends Plugin
         final JsonObject cachedPayload = parseResponseJson(bingoBoardCachedPayload);
         bingoBoardCachedPayload = "";
         final BingoBoardState refreshed = parseBingoBoardPayload(cachedPayload, playerRsn, endpoint);
-        if (refreshed != bingoBoardState)
-        {
-            bingoBoardState = refreshed;
-        }
+        applyBingoBoardState(refreshed);
         updateBingoBoardPopup();
     }
 
