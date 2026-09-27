@@ -40,7 +40,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -287,7 +286,6 @@ public class ParentsGuildPlugin extends Plugin
     private volatile boolean bingoBoardOverlayEnabled = false;
     private ScheduledExecutorService womExecutor;
     private ScheduledExecutorService clanChatRelayExecutor;
-    private ExecutorService boardImageExecutor;
     private ScheduledFuture<?> womRefreshTask;
     private ScheduledFuture<?> bingoStatusTask;
     private ScheduledFuture<?> bingoBoardTask;
@@ -380,11 +378,6 @@ public class ParentsGuildPlugin extends Plugin
         });
         clanChatRelayExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             final Thread thread = new Thread(runnable, "parentsguild-clan-chat");
-            thread.setDaemon(true);
-            return thread;
-        });
-        boardImageExecutor = Executors.newFixedThreadPool(4, runnable -> {
-            final Thread thread = new Thread(runnable, "parentsguild-board-image");
             thread.setDaemon(true);
             return thread;
         });
@@ -513,11 +506,6 @@ public class ParentsGuildPlugin extends Plugin
         {
             clanChatRelayExecutor.shutdownNow();
             clanChatRelayExecutor = null;
-        }
-        if (boardImageExecutor != null)
-        {
-            boardImageExecutor.shutdownNow();
-            boardImageExecutor = null;
         }
         if (womNavigationButton != null)
         {
@@ -4706,27 +4694,54 @@ public class ParentsGuildPlugin extends Plugin
             return cachedImage;
         }
 
-        if (bingoBoardOverlayEnabled)
+        if (queuedBoardImageUrls.add(imageUrl))
         {
-            final BufferedImage loadedImage = loadRemoteImage(imageUrl);
-            if (loadedImage != null)
+            final Request request = new Request.Builder()
+                .url(imageUrl)
+                .header("Accept", "image/png,image/jpeg,image/webp,image/*")
+                .build();
+            okHttpClient.newCall(request).enqueue(new Callback()
             {
-                return loadedImage;
-            }
-        }
-
-        final ExecutorService imageExecutor = boardImageExecutor;
-        if (imageExecutor != null && queuedBoardImageUrls.add(imageUrl))
-        {
-            imageExecutor.execute(() -> {
-                try
+                @Override
+                public void onFailure(Call call, IOException ex)
                 {
-                    loadRemoteImage(imageUrl);
-                }
-                finally
-                {
+                    if (config.debug())
+                    {
+                        log.debug("Failed to load bingo board image {}", imageUrl, ex);
+                    }
                     queuedBoardImageUrls.remove(imageUrl);
                     requestBingoBoardImageRefresh();
+                }
+
+                @Override
+                public void onResponse(Call call, Response response)
+                {
+                    try (Response closeableResponse = response)
+                    {
+                        if (!closeableResponse.isSuccessful() || closeableResponse.body() == null)
+                        {
+                            return;
+                        }
+                        final byte[] imageBytes = closeableResponse.body().bytes();
+                        final BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageBytes));
+                        if (image != null)
+                        {
+                            bingoBoardImageCache.put(imageUrl, image);
+                            storeCachedPluginImage(imageUrl, imageBytes);
+                        }
+                    }
+                    catch (IOException | RuntimeException ex)
+                    {
+                        if (config.debug())
+                        {
+                            log.debug("Failed to load bingo board image {}", imageUrl, ex);
+                        }
+                    }
+                    finally
+                    {
+                    queuedBoardImageUrls.remove(imageUrl);
+                    requestBingoBoardImageRefresh();
+                    }
                 }
             });
         }
