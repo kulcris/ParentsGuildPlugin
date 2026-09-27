@@ -2396,6 +2396,10 @@ public class ParentsGuildPlugin extends Plugin
     {
         bingoBoardState = BingoBoardState.hidden();
         bingoBoardCachedPayload = "";
+        // A hidden board cannot safely accept an "unchanged" response because it
+        // no longer has the grid that response intentionally omits.
+        bingoBoardRevision = "";
+        bingoNotificationRevision = "";
         bingoOverlayState = BingoOverlayState.hidden();
         updateBingoBoardPopup();
     }
