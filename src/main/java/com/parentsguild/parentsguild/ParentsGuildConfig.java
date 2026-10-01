@@ -80,12 +80,25 @@ public interface ParentsGuildConfig extends Config
         return true;
     }
 
+    @Range(min = 10, max = 32)
+    @ConfigItem(
+        keyName = "bingoOverlayFontSize",
+        name = "Bingo overlay font size",
+        description = "Font size for the on-screen bingo label.",
+        section = bingoSection,
+        position = 2
+    )
+    default int bingoOverlayFontSize()
+    {
+        return 16;
+    }
+
     @ConfigItem(
         keyName = "enableBingoMetricTracking",
         name = "Enable bingo metric tracking",
         description = "Track local XP, kill count, and clue metric progress for active bingo metric tiles.",
         section = bingoSection,
-        position = 2
+        position = 3
     )
     default boolean enableBingoMetricTracking()
     {
@@ -109,7 +122,7 @@ public interface ParentsGuildConfig extends Config
         name = "Hide chat in proof screenshots",
         description = "Black out the chatbox area before bingo drop proof screenshots are uploaded.",
         section = bingoSection,
-        position = 3
+        position = 4
     )
     default boolean redactChatboxProofScreenshots()
     {

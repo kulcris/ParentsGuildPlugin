@@ -5122,6 +5122,11 @@ public class ParentsGuildPlugin extends Plugin
         return config.twentyFourHourTime();
     }
 
+    int bingoOverlayFontSize()
+    {
+        return config.bingoOverlayFontSize();
+    }
+
     private String formatDisplayDateTime(Instant instant)
     {
         return ParentsGuildDateTimeFormatter.formatDateTime(instant, useDayFirstDates(), useTwentyFourHourTime());
